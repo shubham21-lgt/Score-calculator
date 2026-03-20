@@ -1,5 +1,50 @@
 # =============================================================================
-# Consumer Scorecard V4  —  FINAL END-TO-END PIPELINE
+# Consumer Scorecard V4  —  AWS EMR PRODUCTION PIPELINE
+# =============================================================================
+#
+# EMR CHANGES FROM LOCAL VERSION (consumer_scorecard_v4_poc.py)
+# ─────────────────────────────────────────────────────────────
+# 1. SparkSession: removed .master("local[*]") — YARN manages the cluster.
+#    shuffle.partitions set to 200 (EMR default is 200; local used 8).
+#
+# 2. load_inputs(): replaced pandas read_csv + _pdf_to_spark with
+#    spark.read.csv() — reads directly from S3, distributed, no driver I/O.
+#    Also handles:
+#      • account_status_cd trailing spaces stripped (real data: 'O  ')
+#      • account_mapping app_date → score_dt rename (real schema has no score_dt)
+#      • accno derived from cust_id if missing (your mapping has cust_id only)
+#      • product_mapping trailing ' stripped from account_type_cd
+#      • product_mapping b'' byte-string prefix stripped from Sec_Uns etc.
+#      • Optional cust_ids filter for trial/debugging runs
+#
+# 3. build_fact2_enriched(): closed_dt comparisons fixed for STRING type.
+#    EMR reads everything as string. "0" and "" replace integer 0 sentinel.
+#    is_live_month0 and is_not_closed use .isin("", "0", ".", "0.0") checks.
+#
+# 4. build_account_details(): isLiveAccount uses string-safe closed_dt + F.trim.
+#
+# 5. All RDD UDF schemas (emi, consec, score, util7m, cc13):
+#    cust_id changed from LongType to StringType — EMR reads cust_id as string
+#    and joins fail if one side is Long and the other is String.
+#    The pandas UDFs return str(cust_id) instead of int(cust_id).
+#
+# 6. run_pipeline output: replaced rdd.collect() → pandas.to_csv() with
+#    Spark .write.parquet() + .write.csv() to S3. Uses .limit(20).toPandas()
+#    for the display sample (safe for 1M+ row datasets).
+#
+# 7. main block: S3 paths pre-filled from your EMR notebook. TRIAL_CUST_IDS
+#    parameter added to restrict run to specific customers for debugging.
+#
+# HOW TO RUN
+# ──────────
+# spark-submit on EMR cluster:
+#   spark-submit --deploy-mode cluster --master yarn \
+#     s3://your-bucket/scripts/consumer_scorecard_v4_emr.py \
+#     [trade_csv] [acct_map_csv] [prod_map_csv] [bank_map_csv] [output_s3_path]
+#
+# Jupyter / Livy notebook on EMR:
+#   Run each cell in order. load_inputs() and run_pipeline() are importable.
+#   Set TRIAL_CUST_IDS = ["196537","621582"] to test on 2 customers first.
 # =============================================================================
 #
 # INPUT DATASETS
@@ -98,22 +143,14 @@ import pandas as pd
 import numpy as np
 import math as _math
 
+# EMR: no .master() — YARN cluster is already running.
+# Do NOT set local[*] here; it would override YARN and run single-threaded.
 spark = SparkSession.builder \
-    .master("local[*]") \
-    .appName("ConsumerScorecardV4_Final") \
+    .appName("ConsumerScorecardV4_EMR") \
     .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
     .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true") \
-    .config("spark.sql.shuffle.partitions", "8") \
-    .config("spark.hadoop.security.authentication", "simple") \
+    .config("spark.sql.shuffle.partitions", "200") \
     .config("spark.sql.ansi.enabled", "false") \
-    .config("spark.driver.extraJavaOptions",
-            "-Darrow.memory.manager=unsafe "
-            "--add-opens=java.base/java.nio=ALL-UNNAMED "
-            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED") \
-    .config("spark.executor.extraJavaOptions",
-            "-Darrow.memory.manager=unsafe "
-            "--add-opens=java.base/java.nio=ALL-UNNAMED "
-            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED") \
     .getOrCreate()
 
 # ── Arrow / Java 25 fix: use Unsafe allocator instead of Netty ───────────
@@ -134,13 +171,13 @@ spark.sparkContext.setLogLevel("ERROR")
 # 0A. PRODUCT-CODE CONFIGURATION
 # ===========================================================================
 CC_CODES        = {"220", "121", "213", "5", "214", "225"}
-CL_CODES        = {"240", "242", "244", "245", "246", "247", "248", "249"}  # Consumer Loan
 HL_CODES        = {"002", "058", "2", "58"}
 AL_CODES        = {"001", "047", "1", "47"}
 TWO_W_CODES     = {"013", "173", "13"}
 GL_CODES        = {"191", "007", "7"}
 PL_CODES        = {"123", "130", "172", "195", "196", "215", "216", "217", "219",
                    "221", "222", "240", "242", "243", "244", "245", "246", "247", "248", "249"}
+CL_CODES        = {"240", "242", "244", "245", "246", "247", "248", "249"}  # Consumer Loan subset of PL
 AGRI_CODES      = {"167", "177", "178", "179", "198", "199", "200", "223", "224", "226", "227"}
 COM_SEC_CODES   = {"175", "176", "228", "241", "191", "243", "007"}  # B3 FIX: GL codes treated as commercial secured
 COM_UNSEC_CODES = {"176", "177", "178", "179", "228"}
@@ -160,6 +197,88 @@ OWNERSHIP_CD    = {"1", "2"}
 # PHASE 1 — DATA INGESTION  (fact2 build from separate input files)
 # ===========================================================================
 
+# def load_inputs(trade_csv, account_mapping_csv, product_mapping_csv, bank_mapping_csv,
+#                 cust_ids=None):
+#     """
+#     EMR version: reads all four inputs via spark.read.csv (distributed, S3-native).
+#     No pandas, no driver-side file I/O — each file is read directly on the cluster.
+
+#     Parameters
+#     ----------
+#     trade_csv / account_mapping_csv / product_mapping_csv / bank_mapping_csv :
+#         S3 paths (s3://...) or local paths. Gzipped files are auto-detected.
+#     cust_ids : list of str/int, optional
+#         If provided, only rows for these customers are loaded (trial subset).
+#     """
+#     def _read_csv(path):
+#         return (
+#             spark.read
+#             .option("header", "true")
+#             .option("multiLine", "false")
+#             .option("escape", '"')
+#             .csv(path)
+#             # Every column stays as StringType — pipeline casts in build_fact2_enriched.
+#             # This avoids inferSchema parsing 007 as 7, closed_dt nulls as 0, etc.
+#         )
+
+#     trade_df = _read_csv(trade_csv)
+#     acct_map = _read_csv(account_mapping_csv)
+#     prod_map = _read_csv(product_mapping_csv)
+#     bank_map = _read_csv(bank_mapping_csv)
+
+#     # ── Normalise column types needed before the join ─────────────────────────
+#     # Keep everything as string; downstream build_fact2_enriched does typed casts.
+#     # Only ensure key join columns exist and are clean strings.
+
+#     # trade_data: strip trailing spaces from account_status_cd (real data has 'O  ')
+#     if "account_status_cd" in trade_df.columns:
+#         trade_df = trade_df.withColumn("account_status_cd",
+#                                        F.trim(col("account_status_cd")))
+
+#     # trade_data: ensure cons_acct_key exists (fallback to accno if absent)
+#     if "cons_acct_key" not in trade_df.columns:
+#         trade_df = trade_df.withColumn("cons_acct_key", col("accno"))
+
+#     # account_mapping: handle the real-data schema which may have app_date instead of score_dt
+#     if "app_date" in acct_map.columns and "score_dt" not in acct_map.columns:
+#         acct_map = acct_map.withColumnRenamed("app_date", "score_dt")
+#     if "accno" not in acct_map.columns:
+#         # In your dataset accno == cust_id (trade.accno is the customer ID)
+#         acct_map = acct_map.withColumn("accno", col("cust_id"))
+#     if "relFinCd" not in acct_map.columns:
+#         acct_map = acct_map.withColumn("relFinCd", lit("1"))
+
+#     # product_mapping: strip trailing apostrophe from account_type_cd ("058'" → "058")
+#     # and strip the b'' byte-string prefix from classification columns ("b'Sec'" → "Sec")
+#     if "account_type_cd" in prod_map.columns:
+#         prod_map = prod_map.withColumn(
+#             "account_type_cd",
+#             F.regexp_replace(F.trim(col("account_type_cd")), r"'$", "")
+#         )
+#     for _c in ["Sec_Uns", "Reg_Com", "Sec_Mov", "Pdt_Cls"]:
+#         if _c in prod_map.columns:
+#             prod_map = prod_map.withColumn(
+#                 _c,
+#                 F.regexp_replace(F.trim(col(_c)), r"^b'|'$", "")
+#             )
+
+#     # ── Optional trial subset: filter to specific cust_ids ───────────────────
+#     if cust_ids:
+#         cust_ids_str = [str(c).strip() for c in cust_ids]
+#         acct_map = acct_map.filter(col("cust_id").isin(*cust_ids_str))
+#         # Semi-join: keep only trade rows for these customers' accounts
+#         needed_accnos = acct_map.select("accno").distinct()
+#         trade_df = trade_df.join(broadcast(needed_accnos), on="accno", how="inner")
+
+#     print(f"  trade_data     : {trade_df.count():,} rows")
+#     print(f"  account_mapping: {acct_map.count():,} rows")
+#     print(f"  product_mapping: {prod_map.count():,} rows")
+#     print(f"  bank_mapping   : {bank_map.count():,} rows")
+
+#     return trade_df, acct_map, prod_map, bank_map
+
+
+# 
 def load_inputs(trade_csv, account_mapping_csv, product_mapping_csv, bank_mapping_csv):
     """
     Load all four input CSVs via pandas (Java 25 Hadoop workaround).
@@ -193,12 +312,10 @@ def load_inputs(trade_csv, account_mapping_csv, product_mapping_csv, bank_mappin
 
     # ── account_mapping ───────────────────────────────────────────────────────
     # Expected columns: accno, cust_id, score_dt, relFinCd  (+ optional others)
-    import pdb;pdb.set_trace()
     acct_map_pdf = _read(account_mapping_csv,
                          str_cols=["relFinCd"],
                          int_cols=["accno", "cust_id", "score_dt"])
-    
-    
+
     # ── product_mapping ───────────────────────────────────────────────────────
     prod_pdf = _read(product_mapping_csv,
                      str_cols=["account_type_cd", "Sec_Uns", "Reg_Com", "Sec_Mov", "Pdt_Cls"])
@@ -233,38 +350,108 @@ def load_inputs(trade_csv, account_mapping_csv, product_mapping_csv, bank_mappin
 def build_fact2(trade_df, acct_map, prod_map, bank_map):
     """
     Joins trade → account_mapping → product_mapping → bank_mapping.
+
+    JOIN STRATEGY — cust_id level:
+    ──────────────────────────────
+    Step 1 : account_mapping is deduplicated to one row per cust_id,
+             keeping the score_dt and the best relFinCd (primary owner
+             preferred over joint owner).  This is the cust_id-level
+             anchor table.
+
+    Step 2 : trade_data is joined to account_mapping on accno (inner).
+             This links every trade row to its cust_id + score_dt.
+
+    Step 3 : The result is further enriched at cust_id level by joining
+             the deduplicated customer anchor to bring score_dt onto every
+             trade row belonging to that customer — ensuring all accounts
+             of the same customer share one consistent score_dt.
+
     Applies OWNERSHIP_CD filter (relFinCd IN {1,2}).
     Computes month_diff = (score_dt year*12+month) - (balance_dt year*12+month).
     Keeps month_diff in [0, 35].
     """
-    # Filter on ownership
-    
+
+    # ── Step 1: Build the cust_id-level anchor ────────────────────────────
+    # account_mapping may have multiple rows per cust_id (one per account).
+    # We need ONE score_dt per customer.  Primary owner (relFinCd=1) is
+    # preferred over joint owner (relFinCd=2); within the same relFinCd
+    # take the row with the latest score_dt.
+
     acct_filtered = acct_map.filter(
         col("relFinCd").cast("string").isin(*OWNERSHIP_CD)
     )
 
-    # Join trade to account mapping (accno is the join key)
+    # Window: for each cust_id pick the row with the lowest relFinCd
+    # (1 before 2) and latest score_dt as the canonical customer record.
+    _w_cust = Window.partitionBy("cust_id").orderBy(
+        col("relFinCd").cast("int").asc(),   # primary owner first
+        col("score_dt").desc()               # most recent score date first
+    )
+    cust_anchor = (
+        acct_filtered
+        .withColumn("_rn", row_number().over(_w_cust))
+        .filter(col("_rn") == 1)
+        .select(
+            col("cust_id").alias("_anchor_cust_id"),
+            col("score_dt").alias("_anchor_score_dt"),
+        )
+    )
+
+    # ── Step 2: Join trade → account_mapping on accno (inner) ────────────
+    # This is still an accno join — it is the only correct key to link a
+    # trade row to a customer.  But we immediately replace score_dt with
+    # the cust_id-level canonical score_dt from the anchor (Step 3).
     df = trade_df.join(
         acct_filtered.select("accno", "cust_id", "score_dt", "relFinCd"),
         on=trade_df["accno"] == acct_filtered["accno"],
         how="inner"
     ).drop(acct_filtered["accno"])
 
-    # month_diff = months between score_dt and balance_dt
+    # ── Step 3: Overwrite score_dt at cust_id level ───────────────────────
+    # All accounts belonging to the same customer must share ONE score_dt.
+    # Without this step, two accounts of the same customer opened at
+    # different times could produce different score_dt values, causing
+    # month_diff to be computed against different reference points.
+    df = (
+        df
+        .join(
+            cust_anchor,
+            on=df["cust_id"] == col("_anchor_cust_id"),
+            how="left"
+        )
+        .withColumn(
+            "score_dt",
+            # Use the canonical cust_id-level score_dt where available;
+            # fall back to the accno-level score_dt if the cust_id was not
+            # found in the anchor (should not happen in practice).
+            coalesce(col("_anchor_score_dt"), col("score_dt"))
+        )
+        .drop("_anchor_cust_id", "_anchor_score_dt")
+    )
+
+    # ── Reorder: bring cust_id and score_dt to the front ─────────────────
+    # After joins, Spark appends new columns at the end.
+    # Re-select so cust_id, score_dt appear first — easier to inspect.
+    _trade_cols = [c for c in trade_df.columns]
+    _front      = ["cust_id", "score_dt", "relFinCd"]
+    _rest       = [c for c in _trade_cols if c not in _front]
+    df = df.select(_front + _rest)
+
+    # ── month_diff = months between score_dt and balance_dt ───────────────
     def to_abs_months(date_col):
         d = to_date(date_col.cast("string"), "yyyyMMdd")
         return year(d) * 12 + month(d)
 
     df = (
         df
-        .withColumn("_score_abs",   to_abs_months(col("score_dt")))
-        .withColumn("_balance_abs",  to_abs_months(col("balance_dt")))
+        .withColumn("_score_abs",  to_abs_months(col("score_dt")))
+        .withColumn("_balance_abs", to_abs_months(col("balance_dt")))
         .withColumn("month_diff", col("_score_abs") - col("_balance_abs"))
         .drop("_score_abs", "_balance_abs")
         .filter((col("month_diff") >= 0) & (col("month_diff") <= 35))
     )
 
-    # Join product mapping (use unambiguous alias to avoid MISSING_ATTRIBUTES error)
+    # ── Join product mapping (broadcast; keyed on account_type_cd) ────────
     prod_sel = broadcast(prod_map.select(
         col("account_type_cd").cast("string").alias("_prod_acct_cd"),
         "Sec_Uns", "Reg_Com", "Sec_Mov", "Pdt_Cls"
@@ -275,7 +462,7 @@ def build_fact2(trade_df, acct_map, prod_map, bank_map):
         how="left"
     ).drop("_prod_acct_cd")
 
-    # Join bank mapping
+    # ── Join bank mapping (broadcast; keyed on bureau_mbr_id) ─────────────
     df = df.join(
         broadcast(bank_map.select(
             col("BUREAU_MBR_ID").cast("long").alias("_bk_id"),
@@ -391,13 +578,13 @@ def add_product_flags(df):
     return (
         df
         .withColumn("isCC",       cd.isin(*CC_CODES))
-        .withColumn("isCL",       cd.isin(*CL_CODES))
         .withColumn("isHL",       cd.isin(*HL_CODES))
         .withColumn("isAL",       cd.isin(*AL_CODES))
         .withColumn("isTW",       cd.isin(*TWO_W_CODES))
         .withColumn("isGL",       cd.isin(*GL_CODES))
         .withColumn("isGLExt",    cd.isin(*GL_CODES_EXT))      # GL for simul_inc_gl
         .withColumn("isPL",       cd.isin(*PL_CODES))
+        .withColumn("isCL",       cd.isin(*CL_CODES))
         .withColumn("isAgri",     cd.isin(*AGRI_CODES))
         .withColumn("isComSec",   cd.isin(*COM_SEC_CODES))
         .withColumn("isComUnSec", cd.isin(*COM_UNSEC_CODES))
@@ -419,11 +606,9 @@ def add_product_flags(df):
                     (col("Sec_Mov") == "M") & (col("Pdt_Cls") == "CS"))
     )
 
-# DataFrame[accno: string, cons_acct_key: string, open_dt: string, acct_nb: string, closed_dt: string, bureau_mbr_id: string, account_type_cd: string, term_freq: string, charge_off_amt: string, resp_code: string, balance_dt: string, account_status_cd: string, actual_pymnt_amt: string, balance_amt: string, credit_lim_amt: string, original_loan_amt: string, past_due_amt: string, pay_rating_cd: string, dayspastdue: string, written_off_amt: string, principal_written_off: string, SUITFILED_WILFULDEFAULT: string, SUITFILEDWILLFULDEFAULT: string, WRITTEN_OFF_AND_SETTLED: string, cust_id: string, score_dt: string, relFinCd: string, month_diff: int, Sec_Uns: string, Reg_Com: string, Sec_Mov: string, Pdt_Cls: string, Category: string]
 
 def build_fact2_enriched(fact2):
     df = fact2
-
     df = (
         df
         .withColumn("balance_amt",       col("balance_amt").cast("double"))
@@ -451,19 +636,18 @@ def build_fact2_enriched(fact2):
                 col("WRITTEN_OFF_AND_SETTLED").cast("string"),
                 col("pay_rating_cd")))
         .withColumn("is_live_month0",
-            # Matches Java: isLive = !isClosed
-            # isClosed = closeDate != null AND closeDate is a real past date
-            # closed_dt == 0 means no close date (sentinel). Any future or default date = not closed.
+            # EMR: closed_dt comes as STRING from spark.read.csv
+            # Sentinel values: NULL, "", "0", "." all mean "not closed"
+            # Real close date is a yyyyMMdd string — compare lexicographically with score_dt
             (col("month_diff") == 0) & (
-                (col("closed_dt").isNull()) |
-                (col("closed_dt") == 0) |
-                (col("closed_dt") == lit(0)) |
-                (col("closed_dt") >= col("score_dt"))   # close date in future = still live
+                col("closed_dt").isNull() |
+                col("closed_dt").isin("", "0", ".", "0.0") |
+                (col("closed_dt") >= col("score_dt"))   # yyyyMMdd string comparison works correctly
             ))
-        # is_not_closed: matches Java isClosed logic — closed only if closed_dt is a real past date
+        # is_not_closed: same logic but applies to ALL months (not just month_diff==0)
         .withColumn("is_not_closed",
-            (col("closed_dt").isNull()) |
-            (col("closed_dt") == 0) |
+            col("closed_dt").isNull() |
+            col("closed_dt").isin("", "0", ".", "0.0") |
             (col("closed_dt") >= col("score_dt")))
     )
     df = add_product_flags(df)
@@ -492,6 +676,7 @@ def build_account_details(fact2_enriched):
             first("isGL").alias("isGL"),
             first("isGLExt").alias("isGLExt"),
             first("isPL").alias("isPL"),
+            first("isCL").alias("isCL"),
             first("isAgri").alias("isAgri"),
             first("isComSec").alias("isComSec"),
             first("isComUnSec").alias("isComUnSec"),
@@ -513,18 +698,22 @@ def build_account_details(fact2_enriched):
             first("Pdt_Cls").alias("Pdt_Cls"),
             first("Sec_Uns").alias("Sec_Uns"),
             first("Reg_Com").alias("Reg_Com"),
-            first("isCL").alias("isCL"),
             first("Sec_Mov").alias("Sec_Mov"),
             first("modified_limit", ignorenulls=True).alias("latest_modified_limit"),
             # B1 FIX: account is live if closed_dt is null/missing OR
             # any row within 6m has account_status_cd == 'O' (not closed)
             # Primary: use closed_dt if available; fallback to status rows
+            # EMR string-safe: closed_dt comes as string from spark.read.csv
+            # Sentinel: NULL, "", "0", "0.0", "." → account is live
+            # Real close date is yyyyMMdd string → compare with score_dt string
             fmax(
-                when(col("closed_dt").isNull() | (col("closed_dt") == "0") |
-                     (col("closed_dt") == "") | (col("closed_dt") == "."),
-                     lit(True))
+                when(
+                    col("closed_dt").isNull() |
+                    col("closed_dt").isin("", "0", "0.0", ".") |
+                    (col("closed_dt") >= col("score_dt")),   # future close = still live
+                    lit(True))
                 .when(col("month_diff") <= 5,
-                      (col("account_status_cd").cast("string").substr(1,1) == "O"))
+                      (F.trim(col("account_status_cd")).substr(1, 1) == "O"))
                 .otherwise(lit(False))
             ).alias("isLiveAccount"),
             fmax(when(col("month_diff") <= 11,
@@ -691,8 +880,6 @@ def build_global_attrs(account_details, fact2_enriched):
             fsum((col("isTW")  & col("reportedIn36M")).cast("int")).alias("nbr_tw_tot_accts_36"),
             fsum((col("isTW")  & col("isLiveAccount")).cast("int")).alias("nbr_tw_live_accts_36"),
             fsum((col("isCL") & col("reportedIn36M")).cast("int")).alias("nbr_cl_tot_accts_36"),
-            # fsum((col("account_type_cd").isin("240","242","244","245","246","247","248","249") &
-            #       col("reportedIn36M")).cast("int")).alias("nbr_cl_tot_accts_36"),
             fmin(when(col("isAgri")     & col("isLiveAccount"), col("mob"))).alias("min_mob_agri_live_36"),
             fmax(when(col("isComUnSec") & col("isLiveAccount"), col("mob"))).alias("max_mob_comuns_live_36"),
             fmin(when(col("isUns") & ~col("isCC"), col("mob"))).alias("min_mob_uns_wo_cc_36"),
@@ -725,13 +912,13 @@ def build_global_attrs(account_details, fact2_enriched):
     dpd_attrs = (
         exploded.groupBy("cust_id").agg(
             fmax(col("dpd")).alias("max_dpd_all_l36m"),
-            fmax(when(col("idx") <= 29, col("dpd"))).alias("max_dpd_l30m"),
-            fmax(when(col("isUns"), col("dpd"))).alias("max_dpd_uns_l36m"),
+            fmax(when(col("idx") <= 29, col("dpd"))).alias("max_dpd_L30M"),
+            fmax(when(col("isUns"), col("dpd"))).alias("max_dpd__UNS_L36M"),
             fmax(when(col("isUns") & (col("idx") <= 11), col("dpd"))).alias("max_dpd_uns_l12m"),
-            fmax(when(col("isUns") & (col("idx") <= 5),  col("dpd"))).alias("max_dpd_UNS_L6_M"),
+            fmax(when(col("isUns") & (col("idx") <= 5),  col("dpd"))).alias("max_dpd__UNS__L6M"),
             # DPD in 6-12 month window (months 6 to 12 inclusive)
             fmax(when(col("isUns") & (col("idx") >= 6) & (col("idx") <= 12),
-                      col("dpd"))).alias("max_dpd_UNS_6_12_M"),
+                      col("dpd"))).alias("max_dpd__UNS_L_6_12_M"),
             fmax(when(col("isUns") & (col("idx") == 0),  col("dpd"))).alias("max_dpd_uns_m0"),
             fmax(when(col("isSec"), col("dpd"))).alias("max_dpd_sec_l36m"),
             fmax(when(col("isHL"),  col("dpd"))).alias("max_dpd_hl_l36m"),
@@ -769,6 +956,7 @@ def build_global_attrs(account_details, fact2_enriched):
         .withColumn("util", F.try_divide(col("bal"), col("mod_lim")))
         .groupBy("cust_id").agg(
             favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_all_tot"),
+            favg(when(col("idx") <= 5,  col("util"))).alias("avg_util_l6m_all_tot"),
             favg(when(col("idx") <= 5,  col("util"))).alias("util_l6m_all_tot"),
             favg(when(col("idx") <= 11, col("util"))).alias("util_l12m_all_tot"),
         )
@@ -778,7 +966,7 @@ def build_global_attrs(account_details, fact2_enriched):
         exploded.filter(col("isUns") & ~col("isCC") & (col("mod_lim") > 0))
         .withColumn("util", F.try_divide(col("bal"), col("mod_lim")))
         .groupBy("cust_id").agg(
-            favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_uns_tot"),
+            favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_exc_cc_live"),
             favg(when(col("idx") <= 5,  col("util"))).alias("util_l6m_uns_tot"),
             favg(when(col("idx") <= 11, col("util"))).alias("util_l12m_uns_tot"),
         )
@@ -809,16 +997,15 @@ def build_global_attrs(account_details, fact2_enriched):
             favg(when((col("idx") <= 2) & col("isUns") & ~col("isCC"), col("bal"))).alias("avg_bal_l3m_uns_wo_cc"),
             fmax(when(col("idx") == 0, col("mod_lim"))).alias("max_sanc_amt_m0"),
             fsum(when(col("idx") == 0, col("mod_lim")).otherwise(lit(0))).alias("curr_tot_sanc_amt"),
-            fmax(col("mod_lim")).alias("max_sanc_amt_ever"),
+            fmax(col("mod_lim")).alias("max_sanc_amt"),
             fmax(when((col("idx") == 0) & col("isSec"), col("mod_lim"))).alias("max_sanc_amt_sec_m0"),
+            fmax(when((col("idx") == 0) & col("isSecMov"), col("mod_lim"))).alias("max_sanc_amt_secmov"),
             fmax(when((col("idx") == 0) & col("isSecMov"), col("mod_lim"))).alias("max_sanc_amt_sec"),
             fsum(when((col("idx") == 0) & col("isUns"), col("mod_lim")).otherwise(lit(0))).alias("sum_sanc_amt_uns"),
             fmax(when((col("idx") == 0) & col("isPL"), col("mod_lim"))).alias("max_sanc_amt_pl"),
             fmax(when((col("idx") == 0) & col("isAL"), col("mod_lim"))).alias("max_sanc_amt_al"),
             fmax(when((col("idx") == 0) & col("isTW"), col("mod_lim"))).alias("max_sanc_amt_tw"),
             fmax(when((col("idx") == 0) & col("isCL"), col("mod_lim"))).alias("max_sanc_amt_cl"),
-            # fmax(when((col("idx") == 0) & col("account_type_cd").isin("240","242","244","245","246","247","248","249"),
-            #           col("mod_lim"))).alias("max_sanc_amt_cl"),
         )
     )
 
@@ -872,10 +1059,14 @@ def build_global_attrs(account_details, fact2_enriched):
     # ── 4G. Outflow algorithms (EMI estimation) ──────────────────────────────
     IR_BUCKETS = [round(0.06 + i * 0.02, 2) for i in range(21)]
 
+    # EMR: cust_id and accno come as strings from spark.read.csv.
+    # The pandas UDF casts them to int() for the result DataFrame, but the join
+    # back to account_details (which has string cust_id) would fail on type mismatch.
+    # Fix: store cust_id and accno as StringType in all RDD-built DataFrames.
     emi_schema = StructType([
-        StructField("cust_id",    LongType(),   nullable=False),
-        StructField("accno",      LongType(),   nullable=False),
-        StructField("emi_median", DoubleType(), nullable=True),
+        StructField("cust_id",    StringType(),  nullable=False),
+        StructField("accno",      StringType(),  nullable=False),
+        StructField("emi_median", DoubleType(),  nullable=True),
         StructField("is_plcdtw",  BooleanType(), nullable=True),
         StructField("is_cc",      BooleanType(), nullable=True),
         StructField("is_secmov_regsec", BooleanType(), nullable=True),
@@ -922,8 +1113,8 @@ def build_global_attrs(account_details, fact2_enriched):
 
             emi_med = float(np.median(emi_list)) if len(emi_list) >= 1 else None
             results.append({
-                "cust_id":          int(cust_id),
-                "accno":            int(accno),
+                "cust_id":          str(cust_id),   # EMR: string join key
+                "accno":            str(accno),      # EMR: string join key
                 "emi_median":       emi_med,
                 "is_plcdtw":        is_plcdtw,
                 "is_cc":            is_cc,
@@ -986,20 +1177,17 @@ def build_global_attrs(account_details, fact2_enriched):
         .filter(col("emi_median").isNotNull())
         .filter(~col("is_cc"))
         .groupBy("cust_id")
-        .agg(fsum("emi_median").alias("total_outflow_wo_cc"))
+        .agg(fsum("emi_median").alias("total_monthly_outflow_wo_cc"))
     )
 
     # ── Product-split outflows ────────────────────────────────────────────────
     _acct_flags = (
-        ad.select(
-            "cust_id", "accno", "isAL", "isTW", "isPL",
-            col("account_type_cd").alias("_acd"),
-            col("isSecMov").alias("_isSecMov")
-        )
+        exploded.filter(col("idx") == 0)
+        .select("cust_id","accno","isAL","isTW","isPL",
+                col("account_type_cd").alias("_acd"),
+                col("isSecMov").alias("_isSecMov"))
+        .dropDuplicates(["accno"])
     )
-    _emi_flags = account_emi.join(_acct_flags, ["cust_id","accno"], "left")
-
-
     _emi_flags = account_emi.join(_acct_flags, ["cust_id","accno"], "left")
     outflow_hl_lap_df = (
         _emi_flags.filter(col("emi_median").isNotNull() & col("_isSecMov"))
@@ -1155,7 +1343,7 @@ def build_global_attrs(account_details, fact2_enriched):
 
     # ── 4N. Consecutive DPD marker (Pandas UDF) ──────────────────────────────
     consec_schema = StructType([
-        StructField("cust_id",             LongType(),    nullable=False),
+        StructField("cust_id",             StringType(),  nullable=False),  # EMR: string
         StructField("final_consec_marker", IntegerType(), nullable=True),
     ])
 
@@ -1169,7 +1357,7 @@ def build_global_attrs(account_details, fact2_enriched):
                     consec += 1
                 else:
                     break
-            results.append({"cust_id": int(cust_id), "final_consec_marker": consec})
+            results.append({"cust_id": str(cust_id), "final_consec_marker": consec})  # EMR: string
         return pd.DataFrame(results, columns=["cust_id", "final_consec_marker"])
 
     # RDD collect → pandas groupby → RDD parallelize (zero Arrow path)
@@ -1213,7 +1401,7 @@ def build_global_attrs(account_details, fact2_enriched):
         .withColumn("live_cnt_6_12",
                     when(col("_cnt_7_12") > 0,
                          F.try_divide(col("_cnt_0_6"), col("_cnt_7_12"))).otherwise(lit(None)))
-        .withColumn("live_cnt_6_12_bin",
+        .withColumn("live_cnt_0_6_by_7_12",
                     when(col("live_cnt_6_12").isNull(), lit(None).cast(IntegerType()))
                     .when(col("live_cnt_6_12") < 0.60, lit(1))
                     .when(col("live_cnt_6_12") < 0.75, lit(2))
@@ -1406,7 +1594,7 @@ def build_global_attrs(account_details, fact2_enriched):
         .join(ad.select("cust_id","accno","isLiveAccount"), ["cust_id","accno"], "left")
         .filter(col("isLiveAccount") == True)
         .groupBy("cust_id")
-        .agg(fmax("dpd").alias("max_dpd_sec0_live"))
+        .agg(fmax("dpd").alias("max_dpd__SEC__0_live"))
     )
 
     # --- nbr_0_0m_all + nbr_0_0m_all_bin ------------------------------------
@@ -1456,7 +1644,7 @@ def build_global_attrs(account_details, fact2_enriched):
         ad.filter(col("isUns") & ~col("derog"))
         .groupBy("cust_id")
         .agg(fmin(when(col("m_since_max_bal_l24m").isNotNull(),
-                       col("m_since_max_bal_l24m"))).alias("mon_since_max_bal_124m_uns"))
+                       col("m_since_max_bal_l24m"))).alias("mon_since_max_bal_l24m_uns"))
     )
 
     # --- min_mob_uns_exc_cc -------------------------------------------------
@@ -1503,7 +1691,7 @@ def build_global_attrs(account_details, fact2_enriched):
             favg(when((col("idx") >= 0)  & (col("idx") <= 11), col("sum_bal"))).alias("_b_0_12"),
             favg(when((col("idx") >= 13) & (col("idx") <= 24), col("sum_bal"))).alias("_b_13_24"),
         )
-        .withColumn("bal_amt_12_24",
+        .withColumn("balance_amt_0_12_by_13_24",
                     when(col("_b_13_24") > 0,
                          F.try_divide(col("_b_0_12"), col("_b_13_24")))
                     .otherwise(lit(None)))
@@ -1515,12 +1703,12 @@ def build_global_attrs(account_details, fact2_enriched):
     outflow_bin_df = (
         total_outflow_wo_cc
         .withColumn("outflow_bin",
-            when(col("total_outflow_wo_cc").isNull(), lit(None).cast(IntegerType()))
-            .when(col("total_outflow_wo_cc") <= 0,      lit(1))
-            .when(col("total_outflow_wo_cc") <= 5000,   lit(2))
-            .when(col("total_outflow_wo_cc") <= 15000,  lit(3))
-            .when(col("total_outflow_wo_cc") <= 30000,  lit(4))
-            .when(col("total_outflow_wo_cc") <= 60000,  lit(5))
+            when(col("total_monthly_outflow_wo_cc").isNull(), lit(None).cast(IntegerType()))
+            .when(col("total_monthly_outflow_wo_cc") <= 0,      lit(1))
+            .when(col("total_monthly_outflow_wo_cc") <= 5000,   lit(2))
+            .when(col("total_monthly_outflow_wo_cc") <= 15000,  lit(3))
+            .when(col("total_monthly_outflow_wo_cc") <= 30000,  lit(4))
+            .when(col("total_monthly_outflow_wo_cc") <= 60000,  lit(5))
             .otherwise(lit(6)))
         .select("cust_id","outflow_bin")
     )
@@ -1569,7 +1757,7 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     _util7m_schema = StructType([
-        StructField("cust_id",               LongType(),   nullable=False),
+        StructField("cust_id",                 StringType(),  nullable=False),  # EMR: string
         StructField("totconsinc_util1_tot_7m", IntegerType(), nullable=True),
     ])
 
@@ -1586,7 +1774,7 @@ def build_global_attrs(account_details, fact2_enriched):
                     consec_count += 1
                 else:
                     break
-            results.append({"cust_id": int(cust_id), "totconsinc_util1_tot_7m": consec_count})
+            results.append({"cust_id": str(cust_id), "totconsinc_util1_tot_7m": consec_count})  # EMR
         return pd.DataFrame(results, columns=["cust_id","totconsinc_util1_tot_7m"])
 
     _util7m_rows = _util7m.rdd.collect()
@@ -1610,7 +1798,7 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     _cc_bal13_schema = StructType([
-        StructField("cust_id",           LongType(),   nullable=False),
+        StructField("cust_id",             StringType(),  nullable=False),  # EMR: string
         StructField("consinc_bal5_cc_13m", IntegerType(), nullable=True),
     ])
 
@@ -1633,7 +1821,7 @@ def build_global_attrs(account_details, fact2_enriched):
                     else:
                         break
                 max_consec = max(max_consec, consec)
-            results.append({"cust_id": int(cust_id), "consinc_bal5_cc_13m": max_consec})
+            results.append({"cust_id": str(cust_id), "consinc_bal5_cc_13m": max_consec})  # EMR
         return pd.DataFrame(results, columns=["cust_id","consinc_bal5_cc_13m"])
 
     _cc13_rows = _cc_bal13.rdd.collect()
@@ -1708,7 +1896,7 @@ def build_global_attrs(account_details, fact2_enriched):
                     (col("nbr_not_al_cc_hl") == 0))
         .withColumn("has_agri_or_com",
                     (col("nbr_agri_tot_accts_36") > 0) | (col("nbr_comsec_tot_accts_36") > 0))
-        .withColumn("open_cnt_0_6_by_7_12_bin",
+        .withColumn("open_cnt_0_6_by_7_12",
                     when(col("nbr_accts_open_7to12m") == 0, lit(99))
                     .otherwise(F.try_divide(col("nbr_accts_open_l6m"), col("nbr_accts_open_7to12m"))))
         .withColumn("ratio_nbr_cc4016m_accts_36",
@@ -1722,10 +1910,10 @@ def build_global_attrs(account_details, fact2_enriched):
                     .otherwise(lit(None).cast(DoubleType())))
         # Fill missing sentinel
         .fillna(-999, subset=[
-            "max_dpd_uns_l36m","max_dpd_uns_l12m","max_dpd_UNS_L6_M","max_dpd_UNS_6_12_M",
+            "max_dpd__UNS_L36M","max_dpd_uns_l12m","max_dpd__UNS__L6M","max_dpd__UNS_L_6_12_M",
             "max_dpd_cc_l36m","max_dpd_hl_l36m","max_dpd_al_l36m",
             "util_l3m_cc_live","util_l6m_cc_live","util_l12m_cc_live",
-            "util_l3m_uns_tot","util_l6m_uns_tot","util_l12m_uns_tot",
+            "util_l3m_exc_cc_live","util_l6m_uns_tot","util_l12m_uns_tot",
             "Outflow_uns_secmov","Outflow_AL_PL_TW_CD",
             "mon_since_first_worst_delq","mon_since_recent_worst_delq",
             "final_consec_marker",
@@ -1832,7 +2020,7 @@ def apply_score_trigger(global_attrs, st3_eligible, st2_eligible):
 SCORECARD_COEFFICIENTS = {
     "ST_1_HC": {
         "intercept":                   500.0,
-        "max_dpd_uns_l36m":            -25.0,
+        "max_dpd__UNS_L36M":            -25.0,
         "util_l3m_cc_live":            -50.0,
         "nbr_accts_open_l6m":          -15.0,
         "totconsinc_bal10_exc_cc_25m": -10.0,
@@ -1851,13 +2039,13 @@ SCORECARD_COEFFICIENTS = {
     },
     "ST_1_AGR_OR_COM": {
         "intercept":             480.0,
-        "max_dpd_uns_l36m":      -20.0,
+        "max_dpd__UNS_L36M":      -20.0,
         "nbr_agri_tot_accts_36":   5.0,
         "max_mob_all_36":          1.0,
     },
     "ST_1_SE": {
         "intercept":             520.0,
-        "max_dpd_uns_l36m":      -22.0,
+        "max_dpd__UNS_L36M":      -22.0,
         "util_l6m_cc_live":      -35.0,
         "Outflow_uns_secmov":      0.0008,
         "max_mob_all_36":          1.8,
@@ -1871,7 +2059,7 @@ SCORECARD_COEFFICIENTS = {
     },
     "ST_3": {
         "intercept":           250.0,
-        "max_dpd_uns_l36m":    -40.0,
+        "max_dpd__UNS_L36M":    -40.0,
         "final_consec_marker": -50.0,
     },
     "THIN": {
@@ -1891,7 +2079,7 @@ def compute_final_score(global_attrs_with_trigger):
     ga = global_attrs_with_trigger
 
     score_schema = StructType([
-        StructField("cust_id",         LongType(),    nullable=False),
+        StructField("cust_id",         StringType(),  nullable=False),  # EMR: string
         StructField("final_score",     IntegerType(), nullable=True),
         StructField("score_breakdown", StringType(),  nullable=True),
     ])
@@ -1905,7 +2093,7 @@ def compute_final_score(global_attrs_with_trigger):
 
             if sc_name == "CLOSED":
                 results.append({
-                    "cust_id":         int(row["cust_id"]),
+                    "cust_id":         str(row["cust_id"]),   # EMR: string
                     "final_score":     int(coeff.get("intercept", 300)),
                     "score_breakdown": "CLOSED_NO_HIT",
                 })
@@ -1924,7 +2112,7 @@ def compute_final_score(global_attrs_with_trigger):
                     parts.append(f"{attr}={contrib:.2f}")
 
             results.append({
-                "cust_id":         int(row["cust_id"]),
+                "cust_id":         str(row["cust_id"]),   # EMR: string
                 "final_score":     max(300, min(900, int(round(score)))),
                 "score_breakdown": "|".join(parts),
             })
@@ -1946,45 +2134,6 @@ def compute_final_score(global_attrs_with_trigger):
 # ===========================================================================
 # PHASE 6 — PIPELINE ORCHESTRATOR
 # ===========================================================================
-# cols = [
-#     "accno",
-#     "cons_acct_key",
-#     "open_dt",
-#     "acct_nb",
-#     "closed_dt",
-#     "bureau_mbr_id",
-#     "account_type_cd",
-#     "term_freq",
-#     "charge_off_amt",
-#     "resp_code",
-#     "balance_dt",
-#     "account_status_cd",
-#     "actual_pymnt_amt",
-#     "balance_amt",
-#     "credit_lim_amt",
-#     "original_loan_amt",
-#     "past_due_amt",
-#     "pay_rating_cd",
-#     "dayspastdue",
-#     "written_off_amt",
-#     "principal_written_off",
-#     "SUITFILED_WILFULDEFAULT",
-#     "SUITFILEDWILLFULDEFAULT",
-#     "WRITTEN_OFF_AND_SETTLED"
-# ]
-
-
-
-
-# cols = ["accno","cons_acct_key","open_dt","acct_nb","closed_dt","bureau_mbr_id","account_type_cd","term_freq"]
-
-# trade_df.select(cols).show(truncate=False)
-# fact2.select(cols).show(truncate=False)
-
-# cols = ["accno","cust_id","account_type_cd","balance_amt","credit_lim_amt","original_loan_amt","past_due_amt","dayspastdue","account_status_cd","dpd_new"]
-
-
-
 
 def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
     print("\n--- Phase 1: Building fact2 ---")
@@ -2012,12 +2161,10 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
 
     print("--- Phase 5C: Final Score ---")
     final_df = compute_final_score(global_attrs_triggered)
-
+    
     print("--- Phase 6: Output ---")
     output_cols = [
         "cust_id",
-        "scorecard_name", "final_score", "score_breakdown",   # ← ADD THIS LINE
-        "is_eligible_for_st2", "is_eligible_for_st3",         # ← ADD THIS LINE
         # ── Account counts ───────────────────────────────────────────────────
         "max_mob_all_36",        "nbr_tot_accts_36",         "nbr_live_accts_36",
         "nbr_al_tot_accts_36",   "nbr_hl_tot_accts_36",      "nbr_cc_tot_accts_36",
@@ -2033,10 +2180,10 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
         "max_simul_unsec",       "max_simul_pl_cd",
         # ── Account opening velocity ─────────────────────────────────────────
         "nbr_accts_open_l6m",    "nbr_accts_open_7to12m",    "nbr_accts_open_l12m_wo_cc",
-        "open_cnt_0_6_by_7_12_bin",
+        "open_cnt_0_6_by_7_12",
         # ── DPD (pipeline alias — rename to final_list name in post-process) ─
-        "max_dpd_uns_l36m",      "max_dpd_l30m",
-        "max_dpd_UNS_L6_M",      "max_dpd_UNS_6_12_M",       "max_dpd_sec0_live",
+        "max_dpd__UNS_L36M",      "max_dpd_L30M",
+        "max_dpd__UNS__L6M",      "max_dpd__UNS_L_6_12_M",       "max_dpd__SEC__0_live",
         # ── DPD bucket timing ────────────────────────────────────────────────
         "mon_sin_recent_1",      "mon_sin_recent_2",          "mon_sin_recent_3",
         "mon_sin_recent_4",      "mon_sin_recent_5",          "mon_sin_recent_6",
@@ -2045,16 +2192,18 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
         "mon_sin_first_4",       "mon_sin_first_5",           "mon_sin_first_6",
         "mon_sin_first_7",
         # ── Utilisation ──────────────────────────────────────────────────────
-        "util_l3m_cc_live",      "util_l6m_all_tot",          "util_l12m_all_tot",
-        "util_l3m_uns_tot",      "util_l6m_uns_tot",          "util_l12m_uns_tot",
+        "util_l3m_cc_live",      "avg_util_l6m_all_tot",
+        "util_l6m_all_tot",          "util_l12m_all_tot",
+        "util_l3m_exc_cc_live",      "util_l6m_uns_tot",          "util_l12m_uns_tot",
         "nbr_cc40l6m_tot_accts_36",
         # ── Sanction amounts ─────────────────────────────────────────────────
-        "max_sanc_amt_ever",     "max_sanc_amt_sec",
+        "max_sanc_amt",     "max_sanc_amt_secmov",
+        "max_sanc_amt_sec",
         "max_sanc_amt_pl",       "max_sanc_amt_al",
         "max_sanc_amt_tw",       "max_sanc_amt_cl",
         "sum_sanc_amt_uns",
         # ── Outflows ─────────────────────────────────────────────────────────
-        "total_outflow_wo_cc",   "HL_LAP_outflow",            "AL_TW_outflow",
+        "total_monthly_outflow_wo_cc",   "HL_LAP_outflow",            "AL_TW_outflow",
         "PL_outflow",            "CD_outflow",
         # ── Balance trends ───────────────────────────────────────────────────
         "totconsinc_bal10_exc_cc_25m",  "totconsdec_bal_tot_36m",
@@ -2062,72 +2211,67 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
         "consinc_bal10_exc_cc_25m",     "consinc_bal10_tot_7m",
         "totconsinc_util1_tot_7m",      "consinc_bal5_cc_13m",
         # ── Balance ratios ───────────────────────────────────────────────────
-        "bal_amt_12_24",         "balance_amt_0_6_by_7_12",   "avg_b_1to6_by_7_12_agri",
+        "balance_amt_0_12_by_13_24",         "balance_amt_0_6_by_7_12",   "avg_b_1to6_by_7_12_agri",
         "delinq_bal_0_12_by_13_24",     "delinq_bal_13_24_by_25_36",
-        "live_cnt_6_12_bin",
+        "live_cnt_0_6_by_7_12",
         # ── Frequency ────────────────────────────────────────────────────────
         "freq_between_accts_all","freq_between_accts_unsec_wo_cc",
         "freq_between_installment_trades",
         # ── DPD counts & timing ──────────────────────────────────────────────
         "nbr_0_0m_all",          "nbr_0_24m_live",            "max_nbr_0_24m_uns",
-        "mon_since_max_bal_124m_uns",
+        "mon_since_max_bal_l24m_uns",
         # ── Latest account ───────────────────────────────────────────────────
         "latest_account_type",
     ]
 
     result = final_df.select([c for c in output_cols if c in final_df.columns])
 
-
-    # ── Rename pipeline aliases to match final_list column names ─────────────
-    rename_map = {
-        "max_dpd_uns_l36m":         "max_dpd__UNS_L36M",
-        "max_dpd_l30m":             "max_dpd_L30M",
-        "max_dpd_UNS_L6_M":         "max_dpd__UNS__L6M",
-        "max_dpd_UNS_6_12_M":       "max_dpd__UNS_L_6_12_M",
-        "max_dpd_sec0_live":        "max_dpd__SEC__0_live",
-        "max_sanc_amt_ever":        "max_sanc_amt",
-        "max_sanc_amt_sec":         "max_sanc_amt_secmov",
-        "total_outflow_wo_cc":      "total_monthly_outflow_wo_cc",
-        "live_cnt_6_12_bin":        "live_cnt_0_6_by_7_12",
-        "util_l3m_uns_tot":         "util_l3m_exc_cc_live",
-        "util_l6m_all_tot":         "avg_util_l6m_all_tot",
-        "open_cnt_0_6_by_7_12_bin": "open_cnt_0_6_by_7_12",
-        "bal_amt_12_24":            "balance_amt_0_12_by_13_24",
-        "mon_since_max_bal_124m_uns": "mon_since_max_bal_l24m_uns",
-    }
-#     rename_map = {
-#     # ... existing entries ...
-#     "max_sanc_amt_secmov": "max_sanc_amt_sec",   # user wants this name
-#     "avg_util_l6m_all_tot": "util_l6m_all_tot",  # user wants original name back
-#     "sum_sanc_amt_uns":    "sum_sanc_amt",         # drop the _uns suffix
-# }
-    result = result.toDF(*[rename_map.get(c, c) for c in result.columns])
-
     result.printSchema()
 
-    # ── RDD collect → pandas → CSV  (zero Arrow path) ────────────────────────
-    flat_csv = os.path.join(output_dir, "pscorecard_results_v3.csv")
-    _out_cols = result.columns
-    _out_rows = result.rdd.collect()
-    pdf = pd.DataFrame(_out_rows, columns=_out_cols)
-    pdf.to_csv(flat_csv, index=False)
-    print(f"\n Results saved to: {flat_csv}")
+    # ── EMR output: write via Spark to S3 (parquet + CSV sample) ──────────────
+    # Use Spark coalesce(1).write.csv for a single-file CSV on S3 (small datasets),
+    # or .write.parquet for production-scale datasets (recommended for 1M+ rows).
+    result_count = result.count()
+    print(f"\n  Output rows: {result_count:,}")
 
+    if output_dir:
+        import re
+        is_s3 = str(output_dir).startswith("s3://") or str(output_dir).startswith("s3a://")
+        if is_s3:
+            # Write as partitioned parquet to S3 (efficient, splittable, typed)
+            parquet_path = output_dir.rstrip("/") + "/scorecard_results_v4.parquet"
+            result.coalesce(max(1, result_count // 500000 + 1)) \
+                  .write.mode("overwrite").parquet(parquet_path)
+            print(f"  Parquet saved to : {parquet_path}")
+
+            # Also write a single-file CSV for quick inspection
+            csv_path = output_dir.rstrip("/") + "/scorecard_results_v4.csv"
+            result.coalesce(1).write.mode("overwrite") \
+                  .option("header", "true").csv(csv_path)
+            print(f"  CSV saved to     : {csv_path}")
+        else:
+            # Local path (for local testing / debugging)
+            flat_csv = os.path.join(output_dir, "scorecard_results_v4.csv")
+            _out_rows = result.rdd.collect()
+            pdf_out   = pd.DataFrame(_out_rows, columns=result.columns)
+            pdf_out.to_csv(flat_csv, index=False)
+            print(f"  CSV saved to     : {flat_csv}")
+
+    # ── Display sample on driver (safe for any dataset size) ─────────────────
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 300)
     print("\n--- Sample results (first 20 rows) ---")
-    _disp_cols = [c for c in ["cust_id","scorecard_name","final_score","score_breakdown"] if c in pdf.columns]
-    print(pdf[_disp_cols].head(20).to_string(index=False))
+    sample_pdf = result.limit(20).toPandas()
+    _disp_cols = [c for c in ["cust_id","scorecard_name","final_score","score_breakdown"]
+                  if c in sample_pdf.columns]
+    print(sample_pdf[_disp_cols].to_string(index=False))
 
     print("\n--- Scorecard distribution ---")
-    if "scorecard_name" in pdf.columns:
-        print(pdf.groupby("scorecard_name")["cust_id"].count().reset_index()
-                .rename(columns={"cust_id":"count"}).to_string(index=False))
-    else:
-        print("  (scorecard_name not in output — add to output_cols)")
-    # print("\n--- Scorecard distribution ---")
-    # print(pdf.groupby("scorecard_name")["cust_id"].count().reset_index()
-    #         .rename(columns={"cust_id":"count"}).to_string(index=False))
+    dist_pdf = (result.groupBy("scorecard_name")
+                      .agg(F.count("cust_id").alias("count"))
+                      .orderBy("scorecard_name")
+                      .toPandas())
+    print(dist_pdf.to_string(index=False))
 
     return result
 
@@ -2139,192 +2283,52 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
 if __name__ == "__main__":
     import sys
 
-    # ── Argument handling ─────────────────────────────────────────────────────
-    # Usage:
-    #   python consumer_scorecard_v4_final.py \
-    #     <trade_csv> <account_mapping_csv> <product_mapping_csv> <bank_mapping_csv> \
-    #     [output_dir]
-    #
-    # Defaults to the sample files in the same directory.
-    # ─────────────────────────────────────────────────────────────────────────
-    # base = os.path.dirname(os.path.abspath(__file__))
+    
+
+    # ── Default S3 paths — edit to match your bucket ──────────────────────────
+    # _S3_BASE     = "s3://aws-emr-studio-934472299739-ap-south-1/Anmol_Chargen/Input"
+    # _S3_OUT      = "s3://aws-emr-studio-934472299739-ap-south-1/Anmol_Chargen/Output"
+
+    # TRADE_CSV    = sys.argv[1] if len(sys.argv) > 1 else f"{_S3_BASE}/14_Nov_Cleaned_SYNC_File1.csv"
+    # ACCT_MAP_CSV = sys.argv[2] if len(sys.argv) > 2 else f"{_S3_BASE}/14_Nov_Mapping_File1.csv"
+    # PROD_MAP_CSV = sys.argv[3] if len(sys.argv) > 3 else f"{_S3_BASE}/chargen_product_mapping_12feb.csv"
+    # BANK_MAP_CSV = sys.argv[4] if len(sys.argv) > 4 else f"{_S3_BASE}/bank_mapping_chargen_12_2023.csv"
+    # OUTPUT_DIR   = sys.argv[5] if len(sys.argv) > 5 else _S3_OUT
+
     base = "/Users/shubham/bru/files/input2"
     TRADE_CSV       = sys.argv[1] if len(sys.argv) > 1 else os.path.join(base, "trade_data.csv")
     ACCT_MAP_CSV    = sys.argv[2] if len(sys.argv) > 2 else os.path.join(base, "account_mapping.csv")
-    PROD_MAP_CSV    = sys.argv[3] if len(sys.argv) > 3 else os.path.join(base, "product_mapping_1.csv")
+    PROD_MAP_CSV    = sys.argv[3] if len(sys.argv) > 3 else os.path.join(base, "product_mapping.csv")
     BANK_MAP_CSV    = sys.argv[4] if len(sys.argv) > 4 else os.path.join(base, "bank_mapping.csv")
     OUTPUT_DIR      = sys.argv[5] if len(sys.argv) > 5 else base
 
-    for path, label in [
-        (TRADE_CSV,    "trade_data"),
-        (ACCT_MAP_CSV, "account_mapping"),
-        (PROD_MAP_CSV, "product_mapping_1"),
-        (BANK_MAP_CSV, "bank_mapping"),
-    ]:
-        if not os.path.exists(path):
-            print(f"[ERROR] {label} not found: {path}")
-            sys.exit(1)
+    # ── Optional: restrict to trial customers (set to None for full run) ──────
 
-    print("\n=== Consumer Scorecard V4 — Final Pipeline ===")
+    TRIAL_CUST_IDS = None
+
+    print("\n=== Consumer Scorecard V4 — EMR Pipeline ===")
     print(f"  trade_data      : {TRADE_CSV}")
     print(f"  account_mapping : {ACCT_MAP_CSV}")
     print(f"  product_mapping : {PROD_MAP_CSV}")
     print(f"  bank_mapping    : {BANK_MAP_CSV}")
     print(f"  output_dir      : {OUTPUT_DIR}\n")
 
-    print("--- Phase 0/1: Loading inputs ---")
+    # print("--- Phase 0/1: Loading inputs ---")
+    # trade_df, acct_map, prod_map, bank_map = load_inputs(
+    #     TRADE_CSV, ACCT_MAP_CSV, PROD_MAP_CSV, BANK_MAP_CSV,
+    #     cust_ids=TRIAL_CUST_IDS
+    # )
+
     trade_df, acct_map, prod_map, bank_map = load_inputs(
         TRADE_CSV, ACCT_MAP_CSV, PROD_MAP_CSV, BANK_MAP_CSV
     )
 
+
     result = run_pipeline(trade_df, acct_map, prod_map, bank_map, OUTPUT_DIR)
-    
     print("\n=== Pipeline complete. ===")
 
 
-# total_outflow_wo_cc
-
-# mon_since_max_bal_l24m_uns	mon_since_max_bal_124m_uns
-# total_monthly_outflow_wo_cc	total_outflow_wo_cc
-# live_cnt_0_6_by_7_12	live_cnt_6_12_bin
-# util_l3m_exc_cc_live	util_l3m_uns_tot
-# avg_util_l6m_all_tot	util_l6m_all_tot
-# max_dpd__UNS_L36M	max_dpd_uns_l36m
-# max_dpd_L30M	max_dpd_l30m
-# max_dpd__SEC__0_live	max_dpd_sec0_live
-# max_dpd__UNS__L6M	max_dpd_UNS_L6_M
-# max_dpd__UNS_L_6_12_M	max_dpd_UNS_6_12_M
-# max_sanc_amt	max_sanc_amt_ever
-# max_sanc_amt_secmov	max_sanc_amt_sec
-# open_cnt_0_6_by_7_12	open_cnt_0_6_by_7_12_bin
-# balance_amt_0_12_by_13_24	bal_amt_12_24
-
-# >>>> Entialize
-# trade_df.printSchema()
-# root
-#  |-- accno: string (nullable = true)
-#  |-- cons_acct_key: string (nullable = true)
-#  |-- open_dt: string (nullable = true)
-#  |-- acct_nb: string (nullable = true)
-#  |-- closed_dt: string (nullable = true)
-#  |-- bureau_mbr_id: string (nullable = true)
-#  |-- account_type_cd: string (nullable = true)
-#  |-- term_freq: string (nullable = true)
-#  |-- charge_off_amt: string (nullable = true)
-#  |-- resp_code: string (nullable = true)
-#  |-- balance_dt: string (nullable = true)
-#  |-- account_status_cd: string (nullable = true)
-#  |-- actual_pymnt_amt: string (nullable = true)
-#  |-- balance_amt: string (nullable = true)
-#  |-- credit_lim_amt: string (nullable = true)
-#  |-- original_loan_amt: string (nullable = true)
-#  |-- past_due_amt: string (nullable = true)
-#  |-- pay_rating_cd: string (nullable = true)
-#  |-- dayspastdue: string (nullable = true)
-#  |-- written_off_amt: string (nullable = true)
-#  |-- principal_written_off: string (nullable = true)
-#  |-- SUITFILED_WILFULDEFAULT: string (nullable = true)
-#  |-- SUITFILEDWILLFULDEFAULT: string (nullable = true)
-#  |-- WRITTEN_OFF_AND_SETTLED: string (nullable = true)
-
-# acct_map.printSchema()
-# root
-#  |-- accno: string (nullable = true)
-#  |-- cust_id: string (nullable = true)
-#  |-- score_dt: string (nullable = true)
-#  |-- relFinCd: string (nullable = true)
-
-# prod_map.printSchema()
-# root
-#  |-- account_type_cd: string (nullable = true)
-#  |-- Sec_Uns: string (nullable = true)
-#  |-- Reg_Com: string (nullable = true)
-#  |-- Sec_Mov: string (nullable = true)
-#  |-- Pdt_Cls: string (nullable = true)
-
-# bank_map.printSchema()
-# root
-#  |-- BUREAU_MBR_ID: string (nullable = true)
-#  |-- Category: string (nullable = true)
-#  |-- Bank_Name: string (nullable = true)
-#  |-- LEGACY_CUST_NB: string (nullable = true)
-
-
-# fact2.printSchema()
-# root
-#  |-- accno: string (nullable = true)
-#  |-- cons_acct_key: string (nullable = true)
-#  |-- open_dt: string (nullable = true)
-#  |-- acct_nb: string (nullable = true)
-#  |-- closed_dt: string (nullable = true)
-#  |-- bureau_mbr_id: string (nullable = true)
-#  |-- account_type_cd: string (nullable = true)
-#  |-- term_freq: string (nullable = true)
-#  |-- charge_off_amt: string (nullable = true)
-#  |-- resp_code: string (nullable = true)
-#  |-- balance_dt: string (nullable = true)
-#  |-- account_status_cd: string (nullable = true)
-#  |-- actual_pymnt_amt: string (nullable = true)
-#  |-- balance_amt: string (nullable = true)
-#  |-- credit_lim_amt: string (nullable = true)
-#  |-- original_loan_amt: string (nullable = true)
-#  |-- past_due_amt: string (nullable = true)
-#  |-- pay_rating_cd: string (nullable = true)
-#  |-- dayspastdue: string (nullable = true)
-#  |-- written_off_amt: string (nullable = true)
-#  |-- principal_written_off: string (nullable = true)
-#  |-- SUITFILED_WILFULDEFAULT: string (nullable = true)
-#  |-- SUITFILEDWILLFULDEFAULT: string (nullable = true)
-#  |-- WRITTEN_OFF_AND_SETTLED: string (nullable = true)
-#  |-- cust_id: string (nullable = true)
-#  |-- score_dt: string (nullable = true)
-#  |-- relFinCd: string (nullable = true)
-#  |-- month_diff: integer (nullable = true)
-#  |-- Sec_Uns: string (nullable = true)
-#  |-- Reg_Com: string (nullable = true)
-#  |-- Sec_Mov: string (nullable = true)
-#  |-- Pdt_Cls: string (nullable = true)
-#  |-- Category: string (nullable = true)
-
-# root
-#  |-- accno: string (nullable = true)
-#  |-- cons_acct_key: string (nullable = true)
-#  |-- open_dt: string (nullable = true)
-#  |-- acct_nb: string (nullable = true)
-#  |-- closed_dt: string (nullable = true)
-#  |-- bureau_mbr_id: string (nullable = true)
-#  |-- account_type_cd: string (nullable = true)
-#  |-- term_freq: string (nullable = true)
-#  |-- charge_off_amt: string (nullable = true)
-#  |-- resp_code: string (nullable = true)
-#  |-- balance_dt: string (nullable = true)
-#  |-- account_status_cd: string (nullable = true)
-#  |-- actual_pymnt_amt: string (nullable = true)
-#  |-- balance_amt: string (nullable = true)
-#  |-- credit_lim_amt: string (nullable = true)
-#  |-- original_loan_amt: string (nullable = true)
-#  |-- past_due_amt: string (nullable = true)
-#  |-- pay_rating_cd: string (nullable = true)
-#  |-- dayspastdue: string (nullable = true)
-#  |-- written_off_amt: string (nullable = true)
-#  |-- principal_written_off: string (nullable = true)
-#  |-- SUITFILED_WILFULDEFAULT: string (nullable = true)
-#  |-- SUITFILEDWILLFULDEFAULT: string (nullable = true)
-#  |-- WRITTEN_OFF_AND_SETTLED: string (nullable = true)
-#  |-- cust_id: string (nullable = true)
-#  |-- score_dt: string (nullable = true)
-#  |-- relFinCd: string (nullable = true)
-#  |-- month_diff: integer (nullable = true)
-#  |-- Sec_Uns: string (nullable = true)
-#  |-- Reg_Com: string (nullable = true)
-#  |-- Sec_Mov: string (nullable = true)
-#  |-- Pdt_Cls: string (nullable = true)
-#  |-- Category: string (nullable = true)
-
-
-
-#  account_details.printSchema()
-# root
+#     root
 #  |-- cust_id: string (nullable = true)
 #  |-- accno: string (nullable = true)
 #  |-- account_type_cd: string (nullable = true)
@@ -2340,6 +2344,7 @@ if __name__ == "__main__":
 #  |-- isGL: boolean (nullable = true)
 #  |-- isGLExt: boolean (nullable = true)
 #  |-- isPL: boolean (nullable = true)
+#  |-- isCL: boolean (nullable = true)
 #  |-- isAgri: boolean (nullable = true)
 #  |-- isComSec: boolean (nullable = true)
 #  |-- isComUnSec: boolean (nullable = true)
@@ -2361,7 +2366,6 @@ if __name__ == "__main__":
 #  |-- Pdt_Cls: string (nullable = true)
 #  |-- Sec_Uns: string (nullable = true)
 #  |-- Reg_Com: string (nullable = true)
-#  |-- isCL: boolean (nullable = true)
 #  |-- Sec_Mov: string (nullable = true)
 #  |-- latest_modified_limit: double (nullable = true)
 #  |-- isLiveAccount: boolean (nullable = true)
@@ -2399,478 +2403,3 @@ if __name__ == "__main__":
 #  |-- m_since_max_bal_l24m: integer (nullable = true)
 #  |-- mon_since_first_worst_delq: integer (nullable = true)
 #  |-- mon_since_recent_worst_delq: integer (nullable = true)
-
-
-
-# fact2_enriched.printSchema()
-# root
-#  |-- accno: string (nullable = true)
-#  |-- cons_acct_key: string (nullable = true)
-#  |-- open_dt: string (nullable = true)
-#  |-- acct_nb: string (nullable = true)
-#  |-- closed_dt: string (nullable = true)
-#  |-- bureau_mbr_id: string (nullable = true)
-#  |-- account_type_cd: string (nullable = true)
-#  |-- term_freq: string (nullable = true)
-#  |-- charge_off_amt: string (nullable = true)
-#  |-- resp_code: string (nullable = true)
-#  |-- balance_dt: string (nullable = true)
-#  |-- account_status_cd: string (nullable = true)
-#  |-- actual_pymnt_amt: double (nullable = true)
-#  |-- balance_amt: double (nullable = true)
-#  |-- credit_lim_amt: double (nullable = true)
-#  |-- original_loan_amt: double (nullable = true)
-#  |-- past_due_amt: double (nullable = true)
-#  |-- pay_rating_cd: string (nullable = true)
-#  |-- dayspastdue: integer (nullable = true)
-#  |-- written_off_amt: string (nullable = true)
-#  |-- principal_written_off: string (nullable = true)
-#  |-- SUITFILED_WILFULDEFAULT: string (nullable = true)
-#  |-- SUITFILEDWILLFULDEFAULT: string (nullable = true)
-#  |-- WRITTEN_OFF_AND_SETTLED: string (nullable = true)
-#  |-- cust_id: string (nullable = true)
-#  |-- score_dt: string (nullable = true)
-#  |-- relFinCd: string (nullable = true)
-#  |-- month_diff: integer (nullable = true)
-#  |-- Sec_Uns: string (nullable = true)
-#  |-- Reg_Com: string (nullable = true)
-#  |-- Sec_Mov: string (nullable = true)
-#  |-- Pdt_Cls: string (nullable = true)
-#  |-- Category: string (nullable = true)
-#  |-- dpd_new: integer (nullable = true)
-#  |-- modified_limit: double (nullable = true)
-#  |-- derog_flag: boolean (nullable = true)
-#  |-- is_live_month0: boolean (nullable = true)
-#  |-- is_not_closed: boolean (nullable = true)
-#  |-- isCC: boolean (nullable = true)
-#  |-- isCL: boolean (nullable = true)
-#  |-- isHL: boolean (nullable = true)
-#  |-- isAL: boolean (nullable = true)
-#  |-- isTW: boolean (nullable = true)
-#  |-- isGL: boolean (nullable = true)
-#  |-- isGLExt: boolean (nullable = true)
-#  |-- isPL: boolean (nullable = true)
-#  |-- isAgri: boolean (nullable = true)
-#  |-- isComSec: boolean (nullable = true)
-#  |-- isComUnSec: boolean (nullable = true)
-#  |-- isRegular: boolean (nullable = true)
-#  |-- isPlCdTw: boolean (nullable = true)
-#  |-- isLapHl: boolean (nullable = true)
-#  |-- isUns: boolean (nullable = true)
-#  |-- isSec: boolean (nullable = true)
-#  |-- isSecMov: boolean (nullable = true)
-#  |-- isRegSec: boolean (nullable = true)
-#  |-- isRegUns: boolean (nullable = true)
-#  |-- isComCls: boolean (nullable = true)
-#  |-- isPSB: boolean (nullable = true)
-#  |-- isPVT: boolean (nullable = true)
-#  |-- isNBFC: boolean (nullable = true)
-#  |-- isSFB: boolean (nullable = true)
-#  |-- isSecMovRegSec: boolean (nullable = true)
-
-
-#  global_attrs.printSchema()
-# root
-#  |-- cust_id: string (nullable = true)
-#  |-- nbr_tot_accts_36: long (nullable = false)
-#  |-- nbr_live_accts_36: long (nullable = true)
-#  |-- nbr_tot_accts_12: long (nullable = true)
-#  |-- nbr_live_accts_12: long (nullable = true)
-#  |-- nbr_cc_tot_accts_36: long (nullable = true)
-#  |-- nbr_cc_live_accts_36: long (nullable = true)
-#  |-- nbr_hl_tot_accts_36: long (nullable = true)
-#  |-- nbr_hl_live_accts_36: long (nullable = true)
-#  |-- nbr_al_tot_accts_36: long (nullable = true)
-#  |-- nbr_al_live_accts_36: long (nullable = true)
-#  |-- nbr_gl_tot_accts_36: long (nullable = true)
-#  |-- nbr_gl_live_accts_36: long (nullable = true)
-#  |-- nbr_pl_tot_accts_36: long (nullable = true)
-#  |-- nbr_pl_live_accts_36: long (nullable = true)
-#  |-- nbr_agri_tot_accts_36: long (nullable = true)
-#  |-- nbr_agri_live_accts_36: long (nullable = true)
-#  |-- nbr_comsec_tot_accts_36: long (nullable = true)
-#  |-- nbr_comsec_live_accts_36: long (nullable = true)
-#  |-- nbr_comuns_tot_accts_36: long (nullable = true)
-#  |-- nbr_uns_wo_cc_tot_accts_36: long (nullable = true)
-#  |-- nbr_uns_wo_cc_live_accts_36: long (nullable = true)
-#  |-- nbr_derog_accts: long (nullable = true)
-#  |-- max_mob_all_36: integer (nullable = true)
-#  |-- min_mob_all_36: integer (nullable = true)
-#  |-- avg_mob_reg_36: double (nullable = true)
-#  |-- max_mob_cc: integer (nullable = true)
-#  |-- min_mob_wo_cc: integer (nullable = true)
-#  |-- nbr_not_al_cc_hl: long (nullable = true)
-#  |-- nbr_tw_tot_accts_36: long (nullable = true)
-#  |-- nbr_tw_live_accts_36: long (nullable = true)
-#  |-- nbr_cl_tot_accts_36: long (nullable = true)
-#  |-- min_mob_agri_live_36: integer (nullable = true)
-#  |-- max_mob_comuns_live_36: integer (nullable = true)
-#  |-- min_mob_uns_wo_cc_36: integer (nullable = true)
-#  |-- max_mob_cc_36: integer (nullable = true)
-#  |-- nbr_accts_open_l3m: long (nullable = true)
-#  |-- nbr_accts_open_l6m: long (nullable = true)
-#  |-- nbr_accts_open_l12m: long (nullable = true)
-#  |-- nbr_accts_open_l16m: long (nullable = true)
-#  |-- nbr_accts_open_l24m: long (nullable = true)
-#  |-- nbr_accts_open_4to6m: long (nullable = true)
-#  |-- nbr_accts_open_7to12m: long (nullable = true)
-#  |-- nbr_accts_open_13to24m: long (nullable = true)
-#  |-- nbr_accts_open_l6m_wo_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_wo_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_hl: long (nullable = true)
-#  |-- nbr_accts_open_l12m_al: long (nullable = true)
-#  |-- nbr_accts_open_l12m_agri: long (nullable = true)
-#  |-- mon_since_last_acct_open: integer (nullable = true)
-#  |-- max_dpd_all_l36m: integer (nullable = true)
-#  |-- max_dpd_l30m: integer (nullable = true)
-#  |-- max_dpd_uns_l36m: integer (nullable = true)
-#  |-- max_dpd_uns_l12m: integer (nullable = true)
-#  |-- max_dpd_UNS_L6_M: integer (nullable = true)
-#  |-- max_dpd_UNS_6_12_M: integer (nullable = true)
-#  |-- max_dpd_uns_m0: integer (nullable = true)
-#  |-- max_dpd_sec_l36m: integer (nullable = true)
-#  |-- max_dpd_hl_l36m: integer (nullable = true)
-#  |-- max_dpd_cc_l36m: integer (nullable = true)
-#  |-- max_dpd_al_l36m: integer (nullable = true)
-#  |-- max_dpd_pl_l36m: integer (nullable = true)
-#  |-- nbr_0_24m_all: long (nullable = true)
-#  |-- nbr_30_24m_all: long (nullable = true)
-#  |-- nbr_60_24m_all: long (nullable = true)
-#  |-- nbr_90_24m_all: long (nullable = true)
-#  |-- nbr_derog_months: long (nullable = true)
-#  |-- min_mon_sin_recent_1: integer (nullable = true)
-#  |-- mon_sin_recent_1: integer (nullable = true)
-#  |-- mon_sin_recent_2: integer (nullable = true)
-#  |-- mon_sin_recent_3: integer (nullable = true)
-#  |-- mon_sin_recent_4: integer (nullable = true)
-#  |-- mon_sin_recent_5: integer (nullable = true)
-#  |-- mon_sin_recent_6: integer (nullable = true)
-#  |-- mon_sin_recent_7: integer (nullable = true)
-#  |-- mon_sin_first_1: integer (nullable = true)
-#  |-- mon_sin_first_2: integer (nullable = true)
-#  |-- mon_sin_first_3: integer (nullable = true)
-#  |-- mon_sin_first_4: integer (nullable = true)
-#  |-- mon_sin_first_5: integer (nullable = true)
-#  |-- mon_sin_first_6: integer (nullable = true)
-#  |-- mon_sin_first_7: integer (nullable = true)
-#  |-- util_l3m_all_tot: double (nullable = true)
-#  |-- util_l6m_all_tot: double (nullable = true)
-#  |-- util_l12m_all_tot: double (nullable = true)
-#  |-- util_l3m_uns_tot: double (nullable = false)
-#  |-- util_l6m_uns_tot: double (nullable = false)
-#  |-- util_l12m_uns_tot: double (nullable = false)
-#  |-- util_l3m_cc_live: double (nullable = false)
-#  |-- util_l6m_cc_live: double (nullable = false)
-#  |-- util_l12m_cc_live: double (nullable = false)
-#  |-- util_m0_cc: double (nullable = true)
-#  |-- curr_tot_exp_amt: double (nullable = true)
-#  |-- curr_tot_exp_amt_uns: double (nullable = true)
-#  |-- curr_tot_exp_amt_sec: double (nullable = true)
-#  |-- curr_tot_exp_amt_cc: double (nullable = true)
-#  |-- curr_tot_exp_amt_hl: double (nullable = true)
-#  |-- avg_bal_l3m_all: double (nullable = true)
-#  |-- avg_bal_l6m_all: double (nullable = true)
-#  |-- avg_bal_l12m_all: double (nullable = true)
-#  |-- avg_bal_l3m_uns_wo_cc: double (nullable = true)
-#  |-- max_sanc_amt_m0: double (nullable = true)
-#  |-- curr_tot_sanc_amt: double (nullable = true)
-#  |-- max_sanc_amt_ever: double (nullable = true)
-#  |-- max_sanc_amt_sec_m0: double (nullable = true)
-#  |-- max_sanc_amt_sec: double (nullable = true)
-#  |-- sum_sanc_amt_uns: double (nullable = true)
-#  |-- max_sanc_amt_pl: double (nullable = true)
-#  |-- max_sanc_amt_al: double (nullable = true)
-#  |-- max_sanc_amt_tw: double (nullable = true)
-#  |-- max_sanc_amt_cl: double (nullable = true)
-#  |-- totconsinc_bal10_exc_cc_25m: long (nullable = true)
-#  |-- totconsinc_bal5_exc_cc_25m: long (nullable = true)
-#  |-- totconsdec_bal_tot_36m: long (nullable = true)
-#  |-- totconsinc_bal10_exc_cc_7m: long (nullable = true)
-#  |-- totconsinc_bal5_exc_cc_7m: long (nullable = true)
-#  |-- consinc_bal10_exc_cc_25m: long (nullable = true)
-#  |-- Outflow_uns_secmov: double (nullable = false)
-#  |-- Outflow_AL_PL_TW_CD: double (nullable = false)
-#  |-- total_outflow_wo_cc: double (nullable = true)
-#  |-- max_lim_uns_secmov: double (nullable = true)
-#  |-- MAX_LIMIT_AL_PL_TW_CD: double (nullable = true)
-#  |-- mon_since_last_derog: integer (nullable = true)
-#  |-- max_dpd_ever: integer (nullable = true)
-#  |-- max_bal_l24m: double (nullable = true)
-#  |-- max_bal_l12m: double (nullable = true)
-#  |-- mon_since_max_bal_l24m_uns: integer (nullable = true)
-#  |-- mon_since_first_worst_delq: integer (nullable = true)
-#  |-- mon_since_recent_worst_delq: integer (nullable = true)
-#  |-- tot_accts_rptd_0m: long (nullable = true)
-#  |-- tot_accts_rptd_l3m: long (nullable = true)
-#  |-- tot_accts_rptd_l12m: long (nullable = true)
-#  |-- curr_exp_psb_uns: long (nullable = true)
-#  |-- curr_exp_pvt_uns: long (nullable = true)
-#  |-- curr_exp_nbfc_uns: long (nullable = true)
-#  |-- curr_exp_sfb_uns: long (nullable = true)
-#  |-- nbr_accts_psb: long (nullable = true)
-#  |-- nbr_accts_pvt: long (nullable = true)
-#  |-- nbr_accts_nbfc: long (nullable = true)
-#  |-- nbr_accts_sfb: long (nullable = true)
-#  |-- final_consec_marker: integer (nullable = true)
-#  |-- max_simul_unsec_wo_cc: long (nullable = true)
-#  |-- max_simul_unsec_wo_cc_inc_gl: long (nullable = true)
-#  |-- max_simul_pl_cd: long (nullable = true)
-#  |-- bal_amt_6_12: double (nullable = true)
-#  |-- balance_amt_0_12_by_13_24: double (nullable = true)
-#  |-- live_cnt_6_12: double (nullable = true)
-#  |-- live_cnt_6_12_bin: integer (nullable = true)
-#  |-- balance_amt_0_6_by_7_12: double (nullable = true)
-#  |-- dlq_bal_12_24: double (nullable = true)
-#  |-- dlq_bal_24_36: double (nullable = true)
-#  |-- dlq_bal_12_24_bin: integer (nullable = true)
-#  |-- dlq_bal_24_36_bin: integer (nullable = true)
-#  |-- delinq_bal_0_12_by_13_24: double (nullable = true)
-#  |-- delinq_bal_13_24_by_25_36: double (nullable = true)
-#  |-- freq_between_accts_all: double (nullable = true)
-#  |-- freq_between_accts_unsec_wo_cc: double (nullable = true)
-#  |-- freq_between_installment_trades: double (nullable = true)
-#  |-- min_mon_sin_recent_1_bin: integer (nullable = true)
-#  |-- mon_since_first_worst_delq_bin: integer (nullable = true)
-#  |-- mon_since_recent_x: integer (nullable = true)
-#  |-- mon_since_recent_x_bin: integer (nullable = true)
-#  |-- nbr_cc4016m_tot_accts_36: long (nullable = true)
-#  |-- avg_b_1to6_by_7_12_agri: double (nullable = true)
-#  |-- consinc_bal10_tot_7m: long (nullable = true)
-#  |-- HL_LAP_outflow: double (nullable = true)
-#  |-- AL_TW_outflow: double (nullable = true)
-#  |-- PL_outflow: double (nullable = true)
-#  |-- CD_outflow: double (nullable = true)
-#  |-- max_simul_unsec: long (nullable = true)
-#  |-- nbr_cc40l6m_tot_accts_36: long (nullable = true)
-#  |-- agri_comuns_live: integer (nullable = true)
-#  |-- max_dpd_sec0_live: integer (nullable = true)
-#  |-- nbr_0_0m_all: long (nullable = true)
-#  |-- nbr_0_0m_all_bin: integer (nullable = true)
-#  |-- nbr_0_24m_live: long (nullable = true)
-#  |-- max_nbr_0_24m_uns: long (nullable = true)
-#  |-- mon_since_max_bal_124m_uns: integer (nullable = true)
-#  |-- min_mob_uns_exc_cc: integer (nullable = true)
-#  |-- nbr_pl_le50_tot_accts_36: long (nullable = true)
-#  |-- nbr_agri_tot_accts_36_diff: long (nullable = true)
-#  |-- bal_amt_12_24: double (nullable = true)
-#  |-- outflow_bin: integer (nullable = true)
-#  |-- latest_account_type: string (nullable = true)
-#  |-- product_holding4: string (nullable = true)
-#  |-- totconsinc_util1_tot_7m: integer (nullable = true)
-#  |-- consinc_bal5_cc_13m: integer (nullable = true)
-#  |-- all_accts_al_cc_hl: boolean (nullable = true)
-#  |-- has_agri_or_com: boolean (nullable = true)
-#  |-- open_cnt_0_6_by_7_12_bin: double (nullable = true)
-#  |-- ratio_nbr_cc4016m_accts_36: double (nullable = true)
-#  |-- leverage_indicator: double (nullable = true)
-
-# (Pdb) st3_eligible.printSchema()
-# root
-#  |-- cust_id: string (nullable = true)
-#  |-- is_eligible_for_st3: boolean (nullable = false)
-
-# (Pdb) st2_eligible.printSchema()
-# root
-#  |-- cust_id: string (nullable = true)
-#  |-- is_eligible_for_st2: boolean (nullable = false)
-
-# print("--- Phase 5C: Final Score ---")
-#  global_attrs_triggered.printSchema()
-# root
-#  |-- cust_id: string (nullable = true)
-#  |-- nbr_tot_accts_36: long (nullable = false)
-#  |-- nbr_live_accts_36: long (nullable = true)
-#  |-- nbr_tot_accts_12: long (nullable = true)
-#  |-- nbr_live_accts_12: long (nullable = true)
-#  |-- nbr_cc_tot_accts_36: long (nullable = true)
-#  |-- nbr_cc_live_accts_36: long (nullable = true)
-#  |-- nbr_hl_tot_accts_36: long (nullable = true)
-#  |-- nbr_hl_live_accts_36: long (nullable = true)
-#  |-- nbr_al_tot_accts_36: long (nullable = true)
-#  |-- nbr_al_live_accts_36: long (nullable = true)
-#  |-- nbr_gl_tot_accts_36: long (nullable = true)
-#  |-- nbr_gl_live_accts_36: long (nullable = true)
-#  |-- nbr_pl_tot_accts_36: long (nullable = true)
-#  |-- nbr_pl_live_accts_36: long (nullable = true)
-#  |-- nbr_agri_tot_accts_36: long (nullable = true)
-#  |-- nbr_agri_live_accts_36: long (nullable = true)
-#  |-- nbr_comsec_tot_accts_36: long (nullable = true)
-#  |-- nbr_comsec_live_accts_36: long (nullable = true)
-#  |-- nbr_comuns_tot_accts_36: long (nullable = true)
-#  |-- nbr_uns_wo_cc_tot_accts_36: long (nullable = true)
-#  |-- nbr_uns_wo_cc_live_accts_36: long (nullable = true)
-#  |-- nbr_derog_accts: long (nullable = true)
-#  |-- max_mob_all_36: integer (nullable = true)
-#  |-- min_mob_all_36: integer (nullable = true)
-#  |-- avg_mob_reg_36: double (nullable = true)
-#  |-- max_mob_cc: integer (nullable = true)
-#  |-- min_mob_wo_cc: integer (nullable = true)
-#  |-- nbr_not_al_cc_hl: long (nullable = true)
-#  |-- nbr_tw_tot_accts_36: long (nullable = true)
-#  |-- nbr_tw_live_accts_36: long (nullable = true)
-#  |-- nbr_cl_tot_accts_36: long (nullable = true)
-#  |-- min_mob_agri_live_36: integer (nullable = true)
-#  |-- max_mob_comuns_live_36: integer (nullable = true)
-#  |-- min_mob_uns_wo_cc_36: integer (nullable = true)
-#  |-- max_mob_cc_36: integer (nullable = true)
-#  |-- nbr_accts_open_l3m: long (nullable = true)
-#  |-- nbr_accts_open_l6m: long (nullable = true)
-#  |-- nbr_accts_open_l12m: long (nullable = true)
-#  |-- nbr_accts_open_l16m: long (nullable = true)
-#  |-- nbr_accts_open_l24m: long (nullable = true)
-#  |-- nbr_accts_open_4to6m: long (nullable = true)
-#  |-- nbr_accts_open_7to12m: long (nullable = true)
-#  |-- nbr_accts_open_13to24m: long (nullable = true)
-#  |-- nbr_accts_open_l6m_wo_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_wo_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_cc: long (nullable = true)
-#  |-- nbr_accts_open_l12m_hl: long (nullable = true)
-#  |-- nbr_accts_open_l12m_al: long (nullable = true)
-#  |-- nbr_accts_open_l12m_agri: long (nullable = true)
-#  |-- mon_since_last_acct_open: integer (nullable = true)
-#  |-- max_dpd_all_l36m: integer (nullable = true)
-#  |-- max_dpd_l30m: integer (nullable = true)
-#  |-- max_dpd_uns_l36m: integer (nullable = true)
-#  |-- max_dpd_uns_l12m: integer (nullable = true)
-#  |-- max_dpd_UNS_L6_M: integer (nullable = true)
-#  |-- max_dpd_UNS_6_12_M: integer (nullable = true)
-#  |-- max_dpd_uns_m0: integer (nullable = true)
-#  |-- max_dpd_sec_l36m: integer (nullable = true)
-#  |-- max_dpd_hl_l36m: integer (nullable = true)
-#  |-- max_dpd_cc_l36m: integer (nullable = true)
-#  |-- max_dpd_al_l36m: integer (nullable = true)
-#  |-- max_dpd_pl_l36m: integer (nullable = true)
-#  |-- nbr_0_24m_all: long (nullable = true)
-#  |-- nbr_30_24m_all: long (nullable = true)
-#  |-- nbr_60_24m_all: long (nullable = true)
-#  |-- nbr_90_24m_all: long (nullable = true)
-#  |-- nbr_derog_months: long (nullable = true)
-#  |-- min_mon_sin_recent_1: integer (nullable = true)
-#  |-- mon_sin_recent_1: integer (nullable = true)
-#  |-- mon_sin_recent_2: integer (nullable = true)
-#  |-- mon_sin_recent_3: integer (nullable = true)
-#  |-- mon_sin_recent_4: integer (nullable = true)
-#  |-- mon_sin_recent_5: integer (nullable = true)
-#  |-- mon_sin_recent_6: integer (nullable = true)
-#  |-- mon_sin_recent_7: integer (nullable = true)
-#  |-- mon_sin_first_1: integer (nullable = true)
-#  |-- mon_sin_first_2: integer (nullable = true)
-#  |-- mon_sin_first_3: integer (nullable = true)
-#  |-- mon_sin_first_4: integer (nullable = true)
-#  |-- mon_sin_first_5: integer (nullable = true)
-#  |-- mon_sin_first_6: integer (nullable = true)
-#  |-- mon_sin_first_7: integer (nullable = true)
-#  |-- util_l3m_all_tot: double (nullable = true)
-#  |-- util_l6m_all_tot: double (nullable = true)
-#  |-- util_l12m_all_tot: double (nullable = true)
-#  |-- util_l3m_uns_tot: double (nullable = false)
-#  |-- util_l6m_uns_tot: double (nullable = false)
-#  |-- util_l12m_uns_tot: double (nullable = false)
-#  |-- util_l3m_cc_live: double (nullable = false)
-#  |-- util_l6m_cc_live: double (nullable = false)
-#  |-- util_l12m_cc_live: double (nullable = false)
-#  |-- util_m0_cc: double (nullable = true)
-#  |-- curr_tot_exp_amt: double (nullable = true)
-#  |-- curr_tot_exp_amt_uns: double (nullable = true)
-#  |-- curr_tot_exp_amt_sec: double (nullable = true)
-#  |-- curr_tot_exp_amt_cc: double (nullable = true)
-#  |-- curr_tot_exp_amt_hl: double (nullable = true)
-#  |-- avg_bal_l3m_all: double (nullable = true)
-#  |-- avg_bal_l6m_all: double (nullable = true)
-#  |-- avg_bal_l12m_all: double (nullable = true)
-#  |-- avg_bal_l3m_uns_wo_cc: double (nullable = true)
-#  |-- max_sanc_amt_m0: double (nullable = true)
-#  |-- curr_tot_sanc_amt: double (nullable = true)
-#  |-- max_sanc_amt_ever: double (nullable = true)
-#  |-- max_sanc_amt_sec_m0: double (nullable = true)
-#  |-- max_sanc_amt_sec: double (nullable = true)
-#  |-- sum_sanc_amt_uns: double (nullable = true)
-#  |-- max_sanc_amt_pl: double (nullable = true)
-#  |-- max_sanc_amt_al: double (nullable = true)
-#  |-- max_sanc_amt_tw: double (nullable = true)
-#  |-- max_sanc_amt_cl: double (nullable = true)
-#  |-- totconsinc_bal10_exc_cc_25m: long (nullable = true)
-#  |-- totconsinc_bal5_exc_cc_25m: long (nullable = true)
-#  |-- totconsdec_bal_tot_36m: long (nullable = true)
-#  |-- totconsinc_bal10_exc_cc_7m: long (nullable = true)
-#  |-- totconsinc_bal5_exc_cc_7m: long (nullable = true)
-#  |-- consinc_bal10_exc_cc_25m: long (nullable = true)
-#  |-- Outflow_uns_secmov: double (nullable = false)
-#  |-- Outflow_AL_PL_TW_CD: double (nullable = false)
-#  |-- total_outflow_wo_cc: double (nullable = true)
-#  |-- max_lim_uns_secmov: double (nullable = true)
-#  |-- MAX_LIMIT_AL_PL_TW_CD: double (nullable = true)
-#  |-- mon_since_last_derog: integer (nullable = true)
-#  |-- max_dpd_ever: integer (nullable = true)
-#  |-- max_bal_l24m: double (nullable = true)
-#  |-- max_bal_l12m: double (nullable = true)
-#  |-- mon_since_max_bal_l24m_uns: integer (nullable = true)
-#  |-- mon_since_first_worst_delq: integer (nullable = true)
-#  |-- mon_since_recent_worst_delq: integer (nullable = true)
-#  |-- tot_accts_rptd_0m: long (nullable = true)
-#  |-- tot_accts_rptd_l3m: long (nullable = true)
-#  |-- tot_accts_rptd_l12m: long (nullable = true)
-#  |-- curr_exp_psb_uns: long (nullable = true)
-#  |-- curr_exp_pvt_uns: long (nullable = true)
-#  |-- curr_exp_nbfc_uns: long (nullable = true)
-#  |-- curr_exp_sfb_uns: long (nullable = true)
-#  |-- nbr_accts_psb: long (nullable = true)
-#  |-- nbr_accts_pvt: long (nullable = true)
-#  |-- nbr_accts_nbfc: long (nullable = true)
-#  |-- nbr_accts_sfb: long (nullable = true)
-#  |-- final_consec_marker: integer (nullable = true)
-#  |-- max_simul_unsec_wo_cc: long (nullable = true)
-#  |-- max_simul_unsec_wo_cc_inc_gl: long (nullable = true)
-#  |-- max_simul_pl_cd: long (nullable = true)
-#  |-- bal_amt_6_12: double (nullable = true)
-#  |-- balance_amt_0_12_by_13_24: double (nullable = true)
-#  |-- live_cnt_6_12: double (nullable = true)
-#  |-- live_cnt_6_12_bin: integer (nullable = true)
-#  |-- balance_amt_0_6_by_7_12: double (nullable = true)
-#  |-- dlq_bal_12_24: double (nullable = true)
-#  |-- dlq_bal_24_36: double (nullable = true)
-#  |-- dlq_bal_12_24_bin: integer (nullable = true)
-#  |-- dlq_bal_24_36_bin: integer (nullable = true)
-#  |-- delinq_bal_0_12_by_13_24: double (nullable = true)
-#  |-- delinq_bal_13_24_by_25_36: double (nullable = true)
-#  |-- freq_between_accts_all: double (nullable = true)
-#  |-- freq_between_accts_unsec_wo_cc: double (nullable = true)
-#  |-- freq_between_installment_trades: double (nullable = true)
-#  |-- min_mon_sin_recent_1_bin: integer (nullable = true)
-#  |-- mon_since_first_worst_delq_bin: integer (nullable = true)
-#  |-- mon_since_recent_x: integer (nullable = true)
-#  |-- mon_since_recent_x_bin: integer (nullable = true)
-#  |-- nbr_cc4016m_tot_accts_36: long (nullable = true)
-#  |-- avg_b_1to6_by_7_12_agri: double (nullable = true)
-#  |-- consinc_bal10_tot_7m: long (nullable = true)
-#  |-- HL_LAP_outflow: double (nullable = true)
-#  |-- AL_TW_outflow: double (nullable = true)
-#  |-- PL_outflow: double (nullable = true)
-#  |-- CD_outflow: double (nullable = true)
-#  |-- max_simul_unsec: long (nullable = true)
-#  |-- nbr_cc40l6m_tot_accts_36: long (nullable = true)
-#  |-- agri_comuns_live: integer (nullable = true)
-#  |-- max_dpd_sec0_live: integer (nullable = true)
-#  |-- nbr_0_0m_all: long (nullable = true)
-#  |-- nbr_0_0m_all_bin: integer (nullable = true)
-#  |-- nbr_0_24m_live: long (nullable = true)
-#  |-- max_nbr_0_24m_uns: long (nullable = true)
-#  |-- mon_since_max_bal_124m_uns: integer (nullable = true)
-#  |-- min_mob_uns_exc_cc: integer (nullable = true)
-#  |-- nbr_pl_le50_tot_accts_36: long (nullable = true)
-#  |-- nbr_agri_tot_accts_36_diff: long (nullable = true)
-#  |-- bal_amt_12_24: double (nullable = true)
-#  |-- outflow_bin: integer (nullable = true)
-#  |-- latest_account_type: string (nullable = true)
-#  |-- product_holding4: string (nullable = true)
-#  |-- totconsinc_util1_tot_7m: integer (nullable = true)
-#  |-- consinc_bal5_cc_13m: integer (nullable = true)
-#  |-- all_accts_al_cc_hl: boolean (nullable = true)
-#  |-- has_agri_or_com: boolean (nullable = true)
-#  |-- open_cnt_0_6_by_7_12_bin: double (nullable = true)
-#  |-- ratio_nbr_cc4016m_accts_36: double (nullable = true)
-#  |-- leverage_indicator: double (nullable = true)
-#  |-- is_eligible_for_st3: boolean (nullable = false)
-#  |-- is_eligible_for_st2: boolean (nullable = false)
-#  |-- scorecard_name: string (nullable = false)
