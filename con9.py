@@ -681,7 +681,7 @@ def build_account_details(fact2_enriched):
         fact2_enriched.filter(col("month_diff") <= 23)
         .withColumn("_rn", row_number().over(
             Window.partitionBy("cust_id", "cons_acct_key")
-                  .orderBy(col("balance_amt").desc(), col("month_diff").asc())))
+                  .orderBy(col("balance_amt").desc(), col("month_diff").asc())))   # REVERTED: .desc() worsened all customers, original .asc() is correct
         .filter(col("_rn") == 1)
         .select("cust_id", "cons_acct_key", col("month_diff").alias("m_since_max_bal_l24m"))
     )
@@ -857,8 +857,20 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     # ── 4D. Utilisation metrics ──────────────────────────────────────────────
+    # util_all_df = (
+    #     exploded.filter(col("mod_lim") > 0)
+    #     .withColumn("util", F.try_divide(col("bal"), col("mod_lim")))
+    #     .groupBy("cust_id").agg(
+    #         favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_all_tot"),
+    #         favg(when(col("idx") <= 5,  col("util"))).alias("util_l6m_all_tot"),
+    #         favg(when(col("idx") <= 11, col("util"))).alias("util_l12m_all_tot"),
+    #     )
+    # )
+    _live_for_util = ad.select("cust_id", "accno", "isLiveAccount").filter(col("isLiveAccount") == True)  # FIX 2
     util_all_df = (
-        exploded.filter(col("mod_lim") > 0)
+        exploded
+        .join(_live_for_util, ["cust_id", "accno"], "inner")   # FIX 2: exclude closed accounts from total util
+        .filter(col("mod_lim") > 0)
         .withColumn("util", F.try_divide(col("bal"), col("mod_lim")))
         .groupBy("cust_id").agg(
             favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_all_tot"),
@@ -868,7 +880,8 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     util_uns_df = (
-        exploded.filter(col("isUns") & ~col("isCC") & (col("mod_lim") > 0))
+        # exploded.filter(col("isUns") & ~col("isCC") & (col("mod_lim") > 0))
+        exploded.filter(col("isUns") & ~col("isCC") & (col("mod_lim") > 0))  # REVERTED: ref=0.0 for 627084 proves ~isCC filter is correct
         .withColumn("util", F.try_divide(col("bal"), col("mod_lim")))
         .groupBy("cust_id").agg(
             favg(when(col("idx") <= 2,  col("util"))).alias("util_l3m_uns_tot"),
@@ -1016,7 +1029,7 @@ def build_global_attrs(account_details, fact2_enriched):
                             b0, b1 = bals[i], bals[i+1]
                             if b0 > 0 and b1 > 0:
                                 emi_est = b1 * (1 + modal_ir / 12) - b0
-                                if emi_est > 0:
+                                if emi_est > 0:                        # REVERTED: original check is correct for all account types
                                     emi_list.append(emi_est)
 
             emi_med = float(np.median(emi_list)) if len(emi_list) >= 1 else None
@@ -1086,7 +1099,7 @@ def build_global_attrs(account_details, fact2_enriched):
     total_outflow_wo_cc = (
         account_emi
         .filter(col("emi_median").isNotNull())
-        .filter(~col("is_cc"))
+        .filter(~col("is_cc"))                                         # REVERTED: ~is_secmov_regsec was too aggressive — broke customers with SecMov accounts
         .groupBy("cust_id")
         .agg(fsum("emi_median").alias("total_outflow_wo_cc"))
     )
@@ -1304,7 +1317,8 @@ def build_global_attrs(account_details, fact2_enriched):
             favg(when((col("idx") >= 0)  & (col("idx") <= 11), col("sum_bal"))).alias("_bal_0_12"),
             favg(when((col("idx") >= 13) & (col("idx") <= 24), col("sum_bal"))).alias("_bal_13_24"),
             favg(when((col("idx") >= 0)  & (col("idx") <= 5),  col("cnt_trades"))).alias("_cnt_0_6"),
-            favg(when((col("idx") >= 7)  & (col("idx") <= 12), col("cnt_trades"))).alias("_cnt_7_12"),
+            # favg(when((col("idx") >= 7)  & (col("idx") <= 12), col("cnt_trades"))).alias("_cnt_7_12"),
+            favg(when((col("idx") >= 6) & (col("idx") <= 11), col("cnt_trades"))).alias("_cnt_7_12"),
         )
         .withColumn("bal_amt_6_12",
                     when(col("_bal_7_12") > 0,
@@ -1375,10 +1389,13 @@ def build_global_attrs(account_details, fact2_enriched):
     # ── 4P. Frequency between account openings ────────────────────────────────
     @udf(DoubleType())
     def avg_gap_udf(arr):
-        if arr is None or len(arr) < 2:
+        if arr is None or len(arr) == 0:
             return None
+        if len(arr) == 1:
+            return 0.0                                         # FIX 4: single account → gap = 0, not None
         gaps = [arr[i+1] - arr[i] for i in range(len(arr)-1) if arr[i+1] != arr[i]]
-        return float(sum(gaps) / len(gaps)) if gaps else None
+        return float(sum(gaps) / len(gaps)) if gaps else 0.0  # FIX 4: return 0 not None when all mobs equal
+    
 
     mob_all_df = (
         ad.groupBy("cust_id")
@@ -1693,14 +1710,14 @@ def build_global_attrs(account_details, fact2_enriched):
         for cust_id, grp in pdf.groupby("cust_id"):
             grp = grp.sort_values("idx")
             utils = dict(zip(grp["idx"], grp["_util_idx"]))
-            consec_count = 0
+            consec_count = 0                                           # REVERTED: break logic is correct per reference
             for m in range(1, 7):
                 u_prev = utils.get(m - 1)
                 u_curr = utils.get(m)
                 if u_prev is not None and u_curr is not None and (u_curr - u_prev) > 0.01:
                     consec_count += 1
                 else:
-                    break
+                    break                                              # VALIDATED: ref=0 for all 3 customers confirms break is needed
             results.append({"cust_id": int(cust_id), "totconsinc_util1_tot_7m": consec_count})
         return pd.DataFrame(results, columns=["cust_id","totconsinc_util1_tot_7m"])
 
@@ -1738,6 +1755,7 @@ def build_global_attrs(account_details, fact2_enriched):
                 acct_grp = acct_grp.sort_values("idx")
                 bals = dict(zip(acct_grp["idx"], acct_grp["bal"]))
                 consec = 0
+                consec = 0                                             # REVERTED: max-streak logic overcounted, ref=0 confirms break is correct
                 for m in range(1, 13):
                     b_prev = bals.get(m - 1)
                     b_curr = bals.get(m)
@@ -1836,9 +1854,11 @@ def build_global_attrs(account_details, fact2_enriched):
                     (col("nbr_not_al_cc_hl") == 0))
         .withColumn("has_agri_or_com",
                     (col("nbr_agri_tot_accts_36") > 0) | (col("nbr_comsec_tot_accts_36") > 0))
+
         .withColumn("open_cnt_0_6_by_7_12_bin",
-                    when(col("nbr_accts_open_7to12m") == 0, lit(99))
-                    .otherwise(F.try_divide(col("nbr_accts_open_l6m"), col("nbr_accts_open_7to12m"))))
+            when(col("nbr_accts_open_7to12m") > 0,
+                    F.try_divide(col("nbr_accts_open_l6m"), col("nbr_accts_open_7to12m")))
+            .otherwise(lit(99)))                                       # VALIDATED: ref=99 for all 3 customers            
         .withColumn("ratio_nbr_cc4016m_accts_36",
                     when(col("nbr_cc_tot_accts_36") > 0,
                          coalesce(col("nbr_cc4016m_tot_accts_36"), lit(0)) /
@@ -2131,7 +2151,26 @@ def compute_final_score(global_attrs_with_trigger):
 
 
 def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
-    print("\n--- Phase 1: Building fact2 ---")
+
+    
+
+    from pyspark.sql.functions import when, col, concat, lit, substring
+
+    # Fix open_dt
+    trade_df = trade_df.withColumn("open_dt",
+        when(
+            col("open_dt").cast("string").endswith("0000"),
+            concat(substring(col("open_dt").cast("string"), 1, 4), lit("0101"))
+        ).otherwise(col("open_dt"))
+    )
+
+    # Fix closed_dt
+    trade_df = trade_df.withColumn("closed_dt",
+        when(
+            col("closed_dt").cast("string").endswith("0000"),
+            concat(substring(col("closed_dt").cast("string"), 1, 4), lit("0101"))
+        ).otherwise(col("closed_dt"))
+   )
     
     fact2 = build_fact2(trade_df, acct_map, prod_map, bank_map)
     print(f"    fact2 rows: {fact2.count():,}")
@@ -2230,21 +2269,18 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
         "max_dpd_UNS_6_12_M":       "max_dpd__UNS_L_6_12_M",
         "max_dpd_sec0_live":        "max_dpd__SEC__0_live",
         "max_sanc_amt_ever":        "max_sanc_amt",
-        "max_sanc_amt_sec":         "max_sanc_amt_secmov",
+        # "max_sanc_amt_sec":         "max_sanc_amt_secmov",
+        "max_sanc_amt_sec":         "max_sanc_amt_secmov",             # RESTORED: ref column name is max_sanc_amt_secmov
         "total_outflow_wo_cc":      "total_monthly_outflow_wo_cc",
         "live_cnt_6_12":            "live_cnt_0_6_by_7_12",  # raw double ratio
         "util_l3m_uns_tot":         "util_l3m_exc_cc_live",
-        "util_l6m_all_tot":         "avg_util_l6m_all_tot",
+        # "util_l6m_all_tot":         "avg_util_l6m_all_tot",
+        "util_l6m_all_tot":         "avg_util_l6m_all_tot",            # RESTORED: ref column name is avg_util_l6m_all_tot
         "open_cnt_0_6_by_7_12_bin": "open_cnt_0_6_by_7_12",
         "bal_amt_12_24":            "balance_amt_0_12_by_13_24",
         "mon_since_max_bal_124m_uns": "mon_since_max_bal_l24m_uns",
     }
-#     rename_map = {
-#     # ... existing entries ...
-#     "max_sanc_amt_secmov": "max_sanc_amt_sec",   # user wants this name
-#     "avg_util_l6m_all_tot": "util_l6m_all_tot",  # user wants original name back
-#     "sum_sanc_amt_uns":    "sum_sanc_amt",         # drop the _uns suffix
-# }
+
     result = result.toDF(*[rename_map.get(c, c) for c in result.columns])
 
     result.printSchema()
@@ -2255,7 +2291,7 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir="."):
     # Solution: collect result rows to driver via RDD, write with pandas.
     # This is safe because the result has one row per customer (not per trade row).
     # For EMR/S3: switch to result.coalesce(1).write.option("header","true").csv(path)
-    flat_csv = os.path.join(output_dir, "con_9.csv")
+    flat_csv = os.path.join(output_dir, "three_customer1.csv")
     _out_cols = result.columns
     _out_rows = result.rdd.collect()              # one row per customer — manageable
     pdf = pd.DataFrame(_out_rows, columns=_out_cols)
@@ -2334,3 +2370,30 @@ if __name__ == "__main__":
 
 # total_outflow_wo_cc
 
+
+
+
+# >>LEVEL 1 — directly computed from open_dt / closed_dt
+# >>>MOB (months on book) — from open_dt
+# mob
+# max_mob_all_36
+# min_mob_all_36
+# avg_mob_reg_36
+# max_mob_cc_36
+# min_mob_uns_wo_cc_36
+# min_mob_agri_live_36
+# max_mob_comuns_live_36
+# mon_since_last_acct_open
+# isLiveAccount flag — from closed_dt
+# isLiveAccount
+# nbr_live_accts_36
+# nbr_live_accts_12
+# nbr_cc_live_accts_36
+# nbr_hl_live_accts_36
+# nbr_al_live_accts_36
+# nbr_pl_live_accts_36
+# nbr_tw_live_accts_36
+# nbr_gl_live_accts_36
+# nbr_agri_live_accts_36
+# nbr_comsec_live_accts_36
+# nbr_uns_wo_cc_live_accts_36
