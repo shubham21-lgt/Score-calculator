@@ -1,7 +1,11 @@
 # =============================================================================
 # Consumer Scorecard V4  —  FINAL END-TO-END PIPELINE
-# VERSION: con_21  (all product_mapping + bank_mapping fixes applied)
+# VERSION: con_14  (all product_mapping + bank_mapping fixes applied)
 # =============================================================================
+print("=" * 60)
+print("  RUNNING con_15.py  — FIXED VERSION")
+print("  Fixes: max_dpd windows + avg_mob_reg_36(isRegular) + nbr_pl_le50 codes + totconsinc_util1 total-count + mon_since_max_bal +1")
+print("=" * 60)
 #
 # INPUT DATASETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -872,9 +876,12 @@ def build_global_attrs(account_details, fact2_enriched):
             fsum(when((col("mob") <= 16) & (col("mob") > 0), lit(1))).alias("nbr_accts_open_l16m"),
             fsum(when((col("mob") <= 24) & (col("mob") > 0), lit(1))).alias("nbr_accts_open_l24m"),
             fsum(when((col("mob") >= 4) & (col("mob") <= 6), lit(1))).alias("nbr_accts_open_4to6m"),
-            # mob 7..12 — open_cnt ratio depends on consistent window with l6m
-            fsum(when((col("mob") >= 7) & (col("mob") <= 12), lit(1))).alias("nbr_accts_open_7to12m"),
+            # Java: monthDiff >= 6 && monthDiff < 12 = mob 6..11
+            fsum(when((col("mob") >= 6) & (col("mob") < 12), lit(1))).alias("nbr_accts_open_7to12m"),
             fsum(when((col("mob") >= 13) & (col("mob") <= 24), lit(1))).alias("nbr_accts_open_13to24m"),
+            # Java openCnt0_6By7_12: mob 0..6 / mob 7..12 with latest_modified_limit>0
+            fsum(when((col("mob").between(0, 6)) & (col("latest_modified_limit") > 0), lit(1))).alias("_open_cnt_l6m"),
+            fsum(when((col("mob").between(7, 12)) & (col("latest_modified_limit") > 0), lit(1))).alias("_open_cnt_7to12m"),
             fsum(when((col("mob") <= 6) & (col("mob") > 0) & ~col("isCC"), lit(1))).alias("nbr_accts_open_l6m_wo_cc"),
             # Java: monthDiff > 0 && < 12 (strictly less than 12 = mob 1..11)
             fsum(when((col("mob") > 0) & (col("mob") < 12) & ~col("isCC"), lit(1))).alias("nbr_accts_open_l12m_wo_cc"),
@@ -934,15 +941,16 @@ def build_global_attrs(account_details, fact2_enriched):
             # min_mon_sin_recent_1 for binning: still uses any DPD (bucket≥1)
             # mon_sin_recent_1 for output: uses dpd≥2 (≥30 raw days) to match org_car
             fmin(when(col("dpd") >= 1, col("idx"))).alias("min_mon_sin_recent_1"),
-            fmin(when(col("dpd") >= 2, col("idx"))).alias("mon_sin_recent_1"),
+            # Java: dpd_new==1 = 1-30 days past due (bucket 1) AND bal>500
+            fmin(when(col("dpd") == 1, col("idx"))).alias("mon_sin_recent_1"),
             fmin(when(col("dpd") == 2, col("idx"))).alias("mon_sin_recent_2"),
             fmin(when(col("dpd") == 3, col("idx"))).alias("mon_sin_recent_3"),
             fmin(when(col("dpd") == 4, col("idx"))).alias("mon_sin_recent_4"),
             fmin(when(col("dpd") == 5, col("idx"))).alias("mon_sin_recent_5"),
             fmin(when(col("dpd") == 6, col("idx"))).alias("mon_sin_recent_6"),
             fmin(when(col("dpd") == 7, col("idx"))).alias("mon_sin_recent_7"),
-            # GENERIC FIX: first_1 also uses dpd>=2 to match org_car 30-day threshold
-            fmax(when(col("dpd") >= 2, col("idx"))).alias("mon_sin_first_1"),
+            # Java: dpd_new==1 = 1-30 days (bucket 1), consistent with mon_sin_recent_1
+            fmax(when(col("dpd") == 1, col("idx"))).alias("mon_sin_first_1"),
             fmax(when(col("dpd") == 2, col("idx"))).alias("mon_sin_first_2"),
             fmax(when(col("dpd") == 3, col("idx"))).alias("mon_sin_first_3"),
             fmax(when(col("dpd") == 4, col("idx"))).alias("mon_sin_first_4"),
@@ -2163,7 +2171,7 @@ def build_global_attrs(account_details, fact2_enriched):
     # ── 4T. NEW ATTRIBUTES (15 columns) ─────────────────────────────────────
 
     # --- agri_comuns_live ---------------------------------------------------
-    #  if(nbr_live_agri>0 && nbr_live_comuns>0) → 4
+    # Java: if(nbr_live_agri>0 && nbr_live_comuns>0) → 4
     #       if(nbr_live_agri>0 && nbr_live_comuns==0) → 3
     #       if(nbr_live_agri==0 && nbr_live_comuns>0) → 2  else → 1
     agri_comuns_live_df = (
@@ -2365,29 +2373,29 @@ def build_global_attrs(account_details, fact2_enriched):
     # then sum across accounts.
     # _util7m: ALL accounts (incl zero-limit), fill missing idx slots with 0 balance/util
     # Java: builds util[0..6] for ALL accounts, missing idx → 0 balance / 0.001 limit
+    # Java: mod1Tot7m uses accountLevelDetailsV4.getModifiedLimit() = account-level MAX
+    # = same limit for every month. Get per-account max first, then join.
+    _acct_max_lim = (
+        exploded
+        .groupBy("cust_id", "_cons_key")
+        .agg(fmax(coalesce(col("mod_lim"), lit(0.001))).alias("_acct_max_lim"))
+    )
     _util7m_per_acct = (
         exploded
         .filter(col("idx") < 7)
+        .join(_acct_max_lim, ["cust_id", "_cons_key"], "left")
         .groupBy("cust_id", "_cons_key", "idx")
         .agg(
             fsum("bal").alias("_acct_bal"),
-            fmax(coalesce(col("mod_lim"), lit(0.001))).alias("_acct_lim"),
+            fmax("_acct_max_lim").alias("_acct_lim"),
         )
     )
-    _util7m_cust_idx = (
-        _util7m_per_acct.select("cust_id").distinct()
-        .crossJoin(spark.range(7).select(col("id").cast("int").alias("idx")))
-    )
+    # Java acctBalMap: only has keys where account actually reported — no fill
     _util7m = (
-        _util7m_cust_idx
-        .join(
-            _util7m_per_acct.groupBy("cust_id","idx").agg(
-                fsum("_acct_bal").alias("_tot_bal"),
-                fsum("_acct_lim").alias("_tot_lim"),
-            ),
-            ["cust_id","idx"], "left"
+        _util7m_per_acct.groupBy("cust_id","idx").agg(
+            fsum("_acct_bal").alias("_tot_bal"),
+            fsum("_acct_lim").alias("_tot_lim"),
         )
-        .fillna({"_tot_bal": 0.0, "_tot_lim": 0.001})
         .withColumn("_util_idx", F.try_divide(col("_tot_bal"), col("_tot_lim")))
     )
 
@@ -2577,8 +2585,9 @@ def build_global_attrs(account_details, fact2_enriched):
             # FIX: GT returns 0 when nbr_accts_open_l6m=0 but 7-12m accounts exist.
             # Old: .otherwise(lit(None)) → Code=NaN for 22 customers.
             # New: coalesce to 0 when denominator>0 (no 0-6m opens, but 7-12m exists).
-            when(col("nbr_accts_open_7to12m") > 0,
-                    coalesce(F.try_divide(col("nbr_accts_open_l6m"), col("nbr_accts_open_7to12m")), lit(0.0)))
+            # Java openCnt ratio: mob 0..6 / mob 7..12 with limit>0
+            when(col("_open_cnt_7to12m") > 0,
+                    coalesce(F.try_divide(col("_open_cnt_l6m"), col("_open_cnt_7to12m")), lit(0.0)))
             .otherwise(lit(None).cast(DoubleType())))
         .withColumn("ratio_nbr_cc4016m_accts_36",
                     when(col("nbr_cc_tot_accts_36") > 0,
@@ -2640,7 +2649,8 @@ def compute_trigger_eligibility(account_details):
 
     # Exact codes from Java: StringUtils.leftPad(woStatus, 3, '0')
     # So "7" → "007", "2" → "002" etc. Stored as float in CSV → cast+lpad needed
-
+    # Java ST3 wo list: 002,003,004,006,008,009,013,014,015,016,017
+    # Java ST2 wo list: same
     derog_wo_st3 = {"002","003","004","006","008","009","013","014","015","016","017"}
     derog_wo_st2 = {"002","003","004","006","008","009","013","014","015","016","017"}
 
@@ -2880,6 +2890,12 @@ def compute_final_score(global_attrs_with_trigger):
 
 
 
+# cols = ["accno","cons_acct_key","open_dt","acct_nb","closed_dt","bureau_mbr_id","account_type_cd","term_freq"]
+
+# trade_df.select(cols).show(truncate=False)
+# fact2.select(cols).show(truncate=False)
+
+# cols = ["accno","cust_id","account_type_cd","balance_amt","credit_lim_amt","original_loan_amt","past_due_amt","dayspastdue","account_status_cd","dpd_new"]
 
     # Fix open_dt
 def clean_numeric_date(colname):
@@ -3165,22 +3181,58 @@ if __name__ == "__main__":
     
     print("\n=== Pipeline complete. ===")
 
-# **84.6% — new record!** +65 exact matches from previous best of 83.9%.
 
 
 
-## Remaining top targets (325 mismatches)
+# ## All fixes applied (81% → 86.3%)
 
-# | Variable | Count | Pattern | Difficulty |
-# |---|---|---|---|
-# | `freq_between_installment_trades` | 91 | Known systematic | ❌ GT validator flags as known |
-# | `freq_between_accts_unsec_wo_cc` | 77 | Known systematic | ❌ GT flags |
-# | `HL_LAP_outflow` | 80 | Code 1.47x HIGH | Medium — EMI formula |
-# | `mon_sin_recent_1` | 60 | Code LOW | Hard — calendar edge |
-# | `mon_sin_first_1` | 56 | Mixed | Hard |
-# | `open_cnt_0_6_by_7_12` | 21 | Code LOW | Medium |
-# | `nbr_accts_open_7to12m` | 28 | Mixed | Medium |
-# | `totconsinc_util1_tot_7m` | 17 | Code LOW | Medium |
-# | `max_simul_unsec` | 9 | Code+1 | Tried, caused regression |
-# | `nbr_comsec_tot_accts_36` | 12 | Code HIGH | Needs firstReport<36 filter |
+# ### Phase 1: +4.3% (81% → 85.4%)
 
+# | Fix | What changed | Why |
+# |---|---|---|
+# | **`CL_CODES = {"189"}`** | Was a larger set; Java confirmed only code 189 is Credit Line | 32/32 customers matched perfectly |
+# | **`isCL = fmax("isCL")`** | Was `first("isCL")` — picked arbitrary row, often False even when account was CL | Java uses max across all rows |
+# | **`consinc_bal10_exc_cc_25m` UDF** | Was breaking at first non-qualifying month → always returned 0. Fixed to scan ALL months for max consecutive run | Java `calculateConcPercIncreaseFlags` resets `cons=0` but continues scanning |
+# | **`max_simul_pl_cd` filter** | Added account_type_cd IN {123, 242, 189} — was including wrong types | Java `allCLProductCodes` confirmed |
+# | **`nbr_accts_open_7to12m`** | Was `mob >= 7 AND mob <= 12`; Java uses `monthDiff >= 6 AND monthDiff < 12` = mob 6..11 | Half-open interval in Java |
+# | **`mon_sin_recent_1`** | Was `dpd >= 2`; Java `getDpd_new()` uses bucket 1 (1–30 days, bal > 500) = `dpd == 1` | Fixed −59 mismatches in one run |
+# | **`mon_sin_first_1`** | Same fix — `dpd == 1` instead of `dpd >= 2` | Fixed −56 mismatches |
+# | **`util_l12m_uns_tot`** | Added separate `_per_acct_uns_util_l12m` DataFrame with NO live account filter | Java confirmed: no isLiveAccount filter |
+# | **`_CV_UNS` product codes** | Expanded unsecured product code set | Java `getAllUnSecProductCodes()` |
+
+# ### Phase 2: +0.9% (85.4% → 86.3%)
+
+# | Fix | What changed | Why |
+# |---|---|---|
+# | **`totconsinc_util1_tot_7m`** | Removed crossjoin fill for missing months — Java's `acctBalMap` skips months with no data | Missing months were being filled with 0, causing false decrease comparisons |
+# | **`totconsinc_util1_tot_7m` limit** | Used account-level `_acct_max_lim = fmax(mod_lim)` for denominator instead of per-month limit | Java `getModifiedLimit()` = account-level single max value |
+# | **`open_cnt_0_6_by_7_12`** | New columns `_open_cnt_l6m` and `_open_cnt_7to12m` using `mob.between(0,6)` / `mob.between(7,12)` with `latest_modified_limit > 0` | Java `openCnt0_6By7_12Bin` uses dedicated opening-month count, different from `nbr_accts_open` |
+
+# ---
+
+# ** gains came from reading the Java source (`getDpd_new`, `calculateConcPercIncreaseFlags`, `calculateTotconsincUtil1tot7mBin`) and matching exact filter conditions, window boundaries, and aggregation logic.
+
+# **Remaining 263 mismatches** are mostly: `freq_between` (168, known by GT validator), `HL_LAP_outflow` (31, EMI formula), and ~64 scattered variables.
+
+
+
+## Recommended targets to fix next (in priority order)
+
+# ### 1. `totconsinc_util1_tot_7m` — 12 failures, Code 0.5x LOW
+# **Root cause confirmed earlier:** The util7m computation still isn't perfectly matching Java's `acctBalMap`. Some customers have `idx=0` missing data. This is a known partial fix — needs further investigation of edge cases.
+
+# ### 2. `max_simul_unsec` — 7 failures, Code **always +1**
+# The +1 is perfectly consistent across all 7 customers. Likely cause: our `isUns` flag (from `Sec_Uns == "UnSec"`) includes codes like 242, 244, 245 etc. that Java's `getAllUnSecProductCodes()` may exclude — or vice versa. Needs data-level verification per customer.
+
+# ### 3. `nbr_pl_tot_accts_36` — 8 failures, Code **always HIGH** (+1 to +3)
+# Java's constant `NBR_PL_TOT_ACCTS_36` is **not found** in the Java source — it appears the Java pipeline uses `NBR_TOT_PL_CD_TW_36` (which uses `isPlCdTw`). Your variable may actually be mapping to a Java variable with different product code logic. Need to trace the exact constant name.
+
+# ### 4. `util_l6m_uns_tot` — 23 failures, Code 1.13x HIGH
+# Large volume but complex — our UNS product codes (`isUns`) likely differ from Java for some edge-case codes. Fixing `max_simul_unsec` and `nbr_pl_tot` may cascade into fixing this too (same root cause: UNS code set).
+
+# ### 5. `nbr_cc_tot_accts_36` — 8 failures, Mixed (+1/−1)
+# Mixed direction suggests a boundary condition — likely `reportedIn36M` using `idx <= 35` vs Java's `firstReport < 36`.
+
+# ---
+
+# **Biggest opportunity:** If you can share the Java constant definition file (where `NBR_PL_TOT_ACCTS_36` is defined as a string), we can trace exactly which Java function populates it and fix it precisely.
