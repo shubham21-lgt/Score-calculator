@@ -1,11 +1,7 @@
 # =============================================================================
 # Consumer Scorecard V4  —  FINAL END-TO-END PIPELINE
-# VERSION: con_14  (all product_mapping + bank_mapping fixes applied)
+# VERSION: con_21  (all product_mapping + bank_mapping fixes applied)
 # =============================================================================
-print("=" * 60)
-print("  RUNNING con_15.py  — FIXED VERSION")
-print("  Fixes: max_dpd windows + avg_mob_reg_36(isRegular) + nbr_pl_le50 codes + totconsinc_util1 total-count + mon_since_max_bal +1")
-print("=" * 60)
 #
 # INPUT DATASETS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1307,32 +1303,31 @@ def build_global_attrs(account_details, fact2_enriched):
     ])
 
     def compute_consinc_bal10_exc_cc(pdf):
-        # Java calculateConsincBal10Exc_cc_25m:
-        #   bal[index] where index=0=most_recent, index=1=1mo_ago, ...
-        #   pct = (bal[index] - bal[index+1]) / bal[index+1]  for index=0..23
-        #   MAX consecutive from index=0 where pct >= 0.10
-        # In our data: month_diff=0=recent, month_diff=1=older
-        # We need: for each month_diff m in 0..23, compute (bal[m]-bal[m+1])/bal[m+1]
-        # The trend data has pct_chg = (bal[m] - bal[m+1]) / bal[m+1] already (ASC lead)
-        # BUT trend_pct_rows filters month_diff >= 1. We need month_diff=0 too.
-        # So use the bal dict directly and compute pct manually.
+        # Java calculateConcPercIncreaseFlags(balInc, 25, 0.10):
+        #   Builds percIncList[0..24]: pct[i] = (balInc[i]-balInc[i+1])/balInc[i+1]
+        #   Then finds MAX CONSECUTIVE run where pct > 0.10
+        #   DOES NOT break on first miss — scans all 25 positions for max run
+        # FIX: was breaking on first non-qualifying month → always returned 0
         results = []
         for cust_id, grp in pdf.groupby("cust_id"):
             grp = grp.sort_values("month_diff")
             bal_map = dict(zip(grp["month_diff"], grp["tot_bal"]))
-            consec = 0
-            for m in range(0, 24):   # Java: index 0..23
-                b_curr = bal_map.get(m)
-                b_prev = bal_map.get(m + 1)
-                if b_curr is not None and b_prev is not None and b_prev > 0:
+            max_cons = 0
+            cons = 0
+            for m in range(0, 25):   # Java: index 0..24 (indexLimit=25)
+                b_curr = bal_map.get(m, 0)
+                b_prev = bal_map.get(m + 1, 0)
+                if b_prev > 0:
                     pct = (b_curr - b_prev) / b_prev
-                    if pct >= 0.10:
-                        consec += 1
+                    if pct > 0.10:    # Java: > Percentage (strict)
+                        cons += 1
+                        if cons > max_cons:
+                            max_cons = cons
                     else:
-                        break
+                        cons = 0      # reset but CONTINUE scanning
                 else:
-                    break
-            results.append({"cust_id": int(cust_id), "consinc_bal10_exc_cc_25m": consec})
+                    cons = 0          # Java: DEFAULT_DOUBLE_VALUE breaks streak
+            results.append({"cust_id": int(cust_id), "consinc_bal10_exc_cc_25m": max_cons})
         return pd.DataFrame(results, columns=["cust_id", "consinc_bal10_exc_cc_25m"])
 
     # consinc_bal10_exc_cc_25m consecutive UDF — pass raw balances for idx 0..24
@@ -1861,10 +1856,14 @@ def build_global_attrs(account_details, fact2_enriched):
 
     # Max simultaneous PL+CD (123, 242, 189) per spec
     # GENERIC FIX: _cons_key for counting
+    # Java: allUnSecProductCodes AND in{123,242,189} — NO TW(173) since TW is Sec
+    # index < TWELVE_MONS_PAYMNT_HIST(12) = index 0..11
     simul_plcd_df = (
         exploded
         .filter(
-            col("isPlCdTw") & (col("idx") >= 1) & (col("idx") <= 11) &
+            col("isUns") &
+            col("account_type_cd").isin("123", "242", "189") &
+            (col("idx") >= 0) & (col("idx") <= 11) &
             (col("dpd") <= 4) & col("is_not_closed")
         )
         .groupBy("cust_id", "idx")
@@ -2164,7 +2163,7 @@ def build_global_attrs(account_details, fact2_enriched):
     # ── 4T. NEW ATTRIBUTES (15 columns) ─────────────────────────────────────
 
     # --- agri_comuns_live ---------------------------------------------------
-    # Java: if(nbr_live_agri>0 && nbr_live_comuns>0) → 4
+    #  if(nbr_live_agri>0 && nbr_live_comuns>0) → 4
     #       if(nbr_live_agri>0 && nbr_live_comuns==0) → 3
     #       if(nbr_live_agri==0 && nbr_live_comuns>0) → 2  else → 1
     agri_comuns_live_df = (
@@ -2641,8 +2640,7 @@ def compute_trigger_eligibility(account_details):
 
     # Exact codes from Java: StringUtils.leftPad(woStatus, 3, '0')
     # So "7" → "007", "2" → "002" etc. Stored as float in CSV → cast+lpad needed
-    # Java ST3 wo list: 002,003,004,006,008,009,013,014,015,016,017
-    # Java ST2 wo list: same
+
     derog_wo_st3 = {"002","003","004","006","008","009","013","014","015","016","017"}
     derog_wo_st2 = {"002","003","004","006","008","009","013","014","015","016","017"}
 
@@ -2882,12 +2880,6 @@ def compute_final_score(global_attrs_with_trigger):
 
 
 
-# cols = ["accno","cons_acct_key","open_dt","acct_nb","closed_dt","bureau_mbr_id","account_type_cd","term_freq"]
-
-# trade_df.select(cols).show(truncate=False)
-# fact2.select(cols).show(truncate=False)
-
-# cols = ["accno","cust_id","account_type_cd","balance_amt","credit_lim_amt","original_loan_amt","past_due_amt","dayspastdue","account_status_cd","dpd_new"]
 
     # Fix open_dt
 def clean_numeric_date(colname):
@@ -3173,97 +3165,22 @@ if __name__ == "__main__":
     
     print("\n=== Pipeline complete. ===")
 
+# **84.6% — new record!** +65 exact matches from previous best of 83.9%.
 
-    #
-    ## 82.3% — New best!  (+6.9% from original)
 
-# ---
 
-# ## Complete Analysis: Variables Needing Additional Logic
+## Remaining top targets (325 mismatches)
 
-# ### Progress Summary
-# | Run | Accuracy | Exact | Mismatch |
+# | Variable | Count | Pattern | Difficulty |
 # |---|---|---|---|
-# | Original | 75.4% | 3,512 | 973 |
-# | run-5 | 79.9% | 3,910 | 565 |
-# | run-12 | 82.2% | 4,346 | 430 |
-# | **run-14** | **82.3%** | **4,356** | **420** |
+# | `freq_between_installment_trades` | 91 | Known systematic | ❌ GT validator flags as known |
+# | `freq_between_accts_unsec_wo_cc` | 77 | Known systematic | ❌ GT flags |
+# | `HL_LAP_outflow` | 80 | Code 1.47x HIGH | Medium — EMI formula |
+# | `mon_sin_recent_1` | 60 | Code LOW | Hard — calendar edge |
+# | `mon_sin_first_1` | 56 | Mixed | Hard |
+# | `open_cnt_0_6_by_7_12` | 21 | Code LOW | Medium |
+# | `nbr_accts_open_7to12m` | 28 | Mixed | Medium |
+# | `totconsinc_util1_tot_7m` | 17 | Code LOW | Medium |
+# | `max_simul_unsec` | 9 | Code+1 | Tried, caused regression |
+# | `nbr_comsec_tot_accts_36` | 12 | Code HIGH | Needs firstReport<36 filter |
 
-# ---
-
-# ### Variables Requiring Java Source Code
-
-# **Group 1 — Frequency Formula** (244 failures = **+2.6%** if fixed)
-# - `freq_between_installment_trades`, `freq_between_accts_unsec_wo_cc`, `freq_between_accts_all`
-# - Need: `calculateFrequencyBetweenInstallmentTrades()` — computes calendar-month gaps *between* consecutive account open dates, not from score date
-
-# **Group 2 — Consecutive Increase Logic** (125 failures = **+1.4%**)
-# - `consinc_bal10_exc_cc_25m` (61 always Code=0), `consinc_bal5_cc_13m` (55 Known), `consinc_bal10_tot_7m`
-# - Need: whether Java computes per-account or total balance; CC direction (drawdown vs utilisation)
-
-# **Group 3 — Unsecured Product Code List** (120 failures = **+1.3%**)
-# - `util_l6m_uns_tot` (15% high), `util_l12m_uns_tot`, `util_l3m_cc_live`, `sum_sanc_amt_uns` (48% high)
-# - Need: exact `allUnSecProductCodes` and `allCCProductCodes` sets
-
-# **Group 4 — Consumer Loan (CL) Codes** (97 failures = **+1.0%**)
-# - `nbr_cl_tot_accts_36`, `max_sanc_amt_cl` — we count only half the CL accounts GT has
-# - Need: complete `allCLProductCodes` list
-
-# **Group 5 — Outflow Sparse Reporters** (327 failures = **+3.5%** if relaxed)
-# - `CD_outflow`, `AL_TW_outflow`, `PL_outflow`, `HL_LAP_outflow` — mostly Code=NaN
-# - Need: Java's fallback for 2-consecutive-month reporters + exact `isLiveAccount()` definition
-
-# **Group 6 — MOB Window Definitions** (60 failures = **+0.6%**)
-# - `mon_since_max_bal_l24m_uns`, `balance_amt_0_12_by_13_24`
-# - Need: exact calendar arithmetic for +1 offset and UnSec-only filter spec
-
-# ### Still Fixable Without Java Source (~+1.4%)
-# `totconsinc_util1_tot_7m`, `max_simul_*`, `nbr_cc_tot_accts_36`, `delinq_bal_*`, `live_cnt_0_6_by_7_12`, `mon_sin_*`, `max_dpd_L30M`
-
-# ### Ceiling
-# | Scenario | Target |
-# |---|---|
-# | Without Java source | ~83.7% |
-# | With all Java source | ~88-90% |
-
-
-
-# # >>>>>>
-# Here's the complete breakdown for your EMR deployment:
-
-# ---
-
-# ## Functions Modified vs Untouched
-
-# ### ✅ UNTOUCHED — Deploy as-is, no risk
-# | Function | Purpose |
-# |---|---|
-# | `build_fact2()` | Joins trade data with account/product/bank mappings |
-# | `apply_score_trigger()` | Applies scorecard trigger eligibility |
-# | `compute_final_score()` | Computes the final scorecard score |
-# | `clean_numeric_date()` | Date utility helper |
-
-# ---
-
-# ### 🔧 MODIFIED — What changed inside each
-
-# **`arrow_on()`** *(lines 115–179)* — Global constants block
-# - `PL_CODES` narrowed to `{123, 169, 242}` only
-# - `AL_CODES` added type `221`
-# - `CC_CODES` added type `196`
-# - `REGULAR_CODES` aligned exactly with product_mapping `Reg_Com='Regular'`
-
-# **`load_inputs()`** *(lines 179–291)*
-# - Added dedup fix: removes 104 duplicate trade rows before processing
-
-# **`build_fact2_enriched()`** *(lines 527–582)*
-# - Calls `dpd_new_udf`, `modified_limit_udf`, `derog_flag_udf`, `add_product_flags` — all modified internally
-
-# **`add_product_flags()`** *(lines 484–527)*
-# - Uses the updated `PL_CODES`, `AL_CODES`, `CC_CODES`, `REGULAR_CODES` — all account type flags (`isCC`, `isPL`, `isHL`, `isRegular` etc.) derive from these
-
-# **`build_account_details()`** *(lines 582–768)*
-# - `isLiveAccount` flag logic updated
-# - `reportedIn36M` logic
-# - `nbr_accts_open_l6m`: mob `< 6` (was `≤ 6`)
-# - `avg_mob_reg_36`: uses `isRegular` filter with corrected codes
