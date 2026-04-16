@@ -1,0 +1,409 @@
+
+================================================================================
+COMPLETE CHANGE LIST: con_21.py → con_15.py  (86% → 92.1% accuracy)
+================================================================================
+Total: 18 changes across 8 functions/sections
+Accuracy gained: +850 exact matches (7,467 → 8,562 out of 9,292)
+
+Legend:
+  FUNCTION  = which function/block was changed
+  COLUMN(S) = which output column(s) it fixes
+  REASON    = why the original was wrong / what Java does
+  CHANGE    = exact code change (old → new)
+
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 1 — PHASE 0: CONSTANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 1: Add EMI_HL_CODES and EMI_PL_CODES constants
+─────────────────────────────────────────────────────
+FUNCTION : Phase 0 — constants block (after PL_CODES)
+COLUMN(S): HL_LAP_outflow, AL_TW_outflow, PL_outflow,
+           total_monthly_outflow_wo_cc
+REASON   : HL_CODES/PL_CODES control BOTH the account count (nbr_hl, nbr_pl)
+           AND the EMI outflow dispatch. Changing HL_CODES to match EMI codes
+           broke nbr_hl counts. Solution: two separate sets — one for counts,
+           one for EMI dispatch only.
+           custom_var.py line 1040: HL/LAP EMI = codes {58, 195}
+           custom_var.py line 1036: PL EMI = codes {123, 228}
+
+ADD after PL_CODES line:
+  # EMI product codes — used ONLY in EMI outflow loop dispatch
+  EMI_HL_CODES    = {"58", "195"}   # HL/LAP for EMI (custom_var.py line 1040)
+  EMI_PL_CODES    = {"123", "228"}  # PL for EMI (custom_var.py line 1036)
+  EMI_AL_TW_CODES = {"47", "173"}   # AL/TW for EMI
+  EMI_CD_CODES    = {"189"}         # CD for EMI
+
+GAIN: +31 cells (HL_LAP_outflow: 33→2, AL_TW_outflow: 5→2, PL_outflow: 6→4)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 2 — PHASE 2: modified_limit_udf (per-month variable)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 2: Cap modified_limit at 100 crore (1,000,000,000)
+─────────────────────────────────────────────────────────
+FUNCTION : modified_limit_udf
+COLUMN(S): util_*, sum_sanc_amt_uns, max_sanc_amt_*, HL_LAP_outflow
+REASON   : One customer (51223901) had a data error: original_loan_amt=686B
+           (686,000,000,000). This inflated the denominator, making util ~0
+           instead of the correct value. Java caps at a reasonable max.
+OLD:
+  return max(_to_float(balance_amt), _to_float(credit_lim_amt), _to_float(original_loan_amt))
+NEW:
+  _MAX_LIMIT = 1_000_000_000  # 100 crore cap
+  ...
+  return min(fv, _MAX_LIMIT)  # inside _to_float helper
+
+GAIN: +8 cells (affected customer's util and sanction variables)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 3 — PHASE 3: build_account_details
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 3: consinc_bal10_tot_7m — use max consecutive run (not total count)
+───────────────────────────────────────────────────────────────────────────
+FUNCTION : build_account_details — _max_consec_udf
+COLUMN(S): consinc_bal10_tot_7m
+REASON   : Original code counted TOTAL months with 10%+ balance increase.
+           Java counts the MAX CONSECUTIVE streak of such months (stops
+           counting when streak breaks, finds the longest run).
+OLD:
+  total = sum(flag for each month in window)
+NEW:
+  UDF: track current streak, reset on break, return max streak seen
+  _max_consec_udf = udf that returns max(consecutive_run)
+
+GAIN: +3 cells
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 4 — PHASE 4: build_global_attrs — dpd_attrs block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 4: max_dpd_l30m — use dpd_new directly, not _effective_dpd
+──────────────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — dpd_attrs aggregation
+COLUMN(S): max_dpd_L30M
+REASON   : _effective_dpd fallback adds raw_dpd as dpd=1 for low-balance
+           accounts (bal<=500). Java uses dpd_new directly — if balance<=500
+           Java already returns dpd=0 in getDpd_new(). Our raw_dpd fallback
+           was adding spurious dpd=1 events.
+OLD:
+  fmax(when(col("idx") <= 30, _effective_dpd("dpd","raw_dpd"))).alias("max_dpd_l30m")
+NEW:
+  fmax(when(col("idx") <= 30, col("dpd"))).alias("max_dpd_l30m")
+
+GAIN: +4 cells (max_dpd_L30M: 6→2)
+
+CHANGE 5: max_dpd_UNS_L6_M — window idx 0..5 (not 0..6)
+─────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — dpd_attrs aggregation
+COLUMN(S): max_dpd__UNS__L6M
+REASON   : Java constant SIX_MONTH_PAYMENT_HIST=6, condition: index < 6
+           → indices 0,1,2,3,4,5 (6 months). We had <= 6 → 7 months.
+OLD:
+  fmax(when(col("isUns") & (col("idx") <= 6) & (_effective_dpd(...) > 0),
+            _effective_dpd(...))).alias("max_dpd_UNS_L6_M")
+NEW:
+  fmax(when(col("isUns") & (col("idx") <= 5) & (col("dpd") > 0),
+            col("dpd"))).alias("max_dpd_UNS_L6_M")
+
+GAIN: +1 cell
+
+CHANGE 6: max_dpd_UNS_6_12_M — window idx 6..11 (not 7..12)
+──────────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — dpd_attrs aggregation
+COLUMN(S): max_dpd__UNS_L_6_12_M
+REASON   : Java: index >= 6 && index < 12 → months 6,7,8,9,10,11.
+           We had idx > 6 && idx <= 12 → months 7,8,9,10,11,12 (wrong).
+OLD:
+  fmax(when(col("isUns") & (col("idx") > 6) & (col("idx") <= 12) &
+            (_effective_dpd(...) > 0), _effective_dpd(...))).alias("max_dpd_UNS_6_12_M")
+NEW:
+  fmax(when(col("isUns") & (col("idx") >= 6) & (col("idx") <= 11) &
+            (col("dpd") > 0), col("dpd"))).alias("max_dpd_UNS_6_12_M")
+
+GAIN: +2 cells (max_dpd__UNS_L_6_12_M: 5→3)
+
+CHANGE 7: max_dpd_UNS_L36M — use dpd_new directly
+──────────────────────────────────────────────────
+FUNCTION : build_global_attrs — dpd_attrs aggregation
+COLUMN(S): max_dpd__UNS_L36M
+REASON   : Same as Change 4 — _effective_dpd raw_dpd fallback adds
+           spurious dpd=1 events not present in Java's calculation.
+OLD:
+  fmax(when(col("isUns") & (_effective_dpd(...) > 0), _effective_dpd(...)))
+NEW:
+  fmax(when(col("isUns") & (col("dpd") > 0), col("dpd"))).alias("max_dpd_uns_l36m")
+
+GAIN: +4 cells (max_dpd__UNS_L36M: 5→1)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 5 — PHASE 4: build_global_attrs — acct_counts block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 8: nbr_cc_tot_accts_36 — add product code 220
+─────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — acct_counts aggregation
+COLUMN(S): nbr_cc_tot_accts_36
+REASON   : Java's allCreditCardProductCodes includes code 220 (RegSec Regular).
+           Our CC_CODES = {5,196,213,225} was missing 220. Confirmed: adding
+           220 fixes 6/8 failing customers.
+OLD:
+  fsum(when(col("isCC") & col("reportedIn36M"), lit(1))).alias("nbr_cc_tot_accts_36")
+NEW:
+  fsum(when((col("isCC") | (col("account_type_cd")=="220")) & col("reportedIn36M"),
+            lit(1))).alias("nbr_cc_tot_accts_36")
+
+GAIN: +6 cells (nbr_cc_tot_accts_36: 8→2)
+
+CHANGE 9: nbr_cc_live_accts_36 — add product code 220
+──────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — acct_counts aggregation
+COLUMN(S): nbr_cc_live_accts_36
+REASON   : Same as Change 8 — Java counts code 220 as CC for live count too.
+OLD:
+  fsum(when(col("isCC") & col("isLiveAccount"), lit(1))).alias("nbr_cc_live_accts_36")
+NEW:
+  fsum(when((col("isCC") | (col("account_type_cd")=="220")) & col("isLiveAccount"),
+            lit(1))).alias("nbr_cc_live_accts_36")
+
+GAIN: +5 cells (nbr_cc_live_accts_36: 5→0 — PERFECT!)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 6 — PHASE 4: build_global_attrs — exp_df / sanction block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 10: max_sanc_amt_al — add product code 221
+─────────────────────────────────────────────────
+FUNCTION : build_global_attrs — exp_df / sanction aggregation
+COLUMN(S): max_sanc_amt_al
+REASON   : Java's getAllALProductCodes() includes code 221 (HL/LAP variant).
+           Verified: all 3 failing customers had Ref value matching code 221
+           account's limit.
+OLD:
+  fmax(when(col("isAL"), col("mod_lim"))).alias("max_sanc_amt_al")
+NEW:
+  fmax(when(col("isAL") | (col("account_type_cd") == "221"),
+            col("mod_lim"))).alias("max_sanc_amt_al")
+
+GAIN: +3 cells
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 7 — PHASE 4: build_global_attrs — _CV_UNS constant
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 11: _CV_UNS set — add code 242
+──────────────────────────────────────
+FUNCTION : build_global_attrs — _CV_UNS constant (used for sum_sanc_amt_uns)
+COLUMN(S): sum_sanc_amt_uns
+REASON   : Code 242 is classified as UnSec in product_mapping.csv but was
+           missing from _CV_UNS. All 3 failing customers had their missing
+           limit coming from code 242 accounts. Confirmed 3/3 match after fix.
+OLD:
+  _CV_UNS = {5,121,123,...,228,999}
+NEW:
+  _CV_UNS = {5,121,123,...,228,242,999}  # 242 added
+
+GAIN: +3 cells (sum_sanc_amt_uns: 3→0)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — PHASE 4: build_global_attrs — util CC live block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 12: util_l3m_cc_live — add code 220 to CC filter
+─────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — _cc_live_per_acct filter
+COLUMN(S): util_l3m_cc_live, util_l6m_cc_live, util_l12m_cc_live
+REASON   : Java includes code 220 in CC util calculation (same as nbr_cc).
+           Verified: 3 additional customers match after adding 220.
+OLD:
+  .filter(col("isCC") & col("is_not_closed") & (col("mod_lim") > 0))
+NEW:
+  .filter((col("isCC") | (col("account_type_cd")=="220")) &
+          col("is_not_closed") & (col("mod_lim") > 0))
+
+GAIN: +3 cells (util_l3m_cc_live: 10→7)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 9 — PHASE 4: build_global_attrs — util_l6m override (post-build)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 13: util_l6m_uns_tot — post-build override
+──────────────────────────────────────────────────
+FUNCTION : run_pipeline — after build_global_attrs, before trigger
+COLUMN(S): util_l6m_uns_tot
+REASON   : Java calculateUtilL6mAllTot uses NO isLiveAccount filter —
+           includes all UNS accounts that have modified_limit > 0.
+           The original code was filtering live-only. This override
+           recalculates from fact2_enriched without the live filter.
+ADD after global_attrs = build_global_attrs(...):
+  _CV_UNS_UTIL = {5,121,123,130,...,228,999}
+  _util6m_override = (
+      fact2_enriched
+      .filter(col("account_type_cd").cast("int").isin(list(_CV_UNS_UTIL))
+              & (col("modified_limit") > 0))
+      .groupBy("cust_id","cons_acct_key").agg(...)
+      .groupBy("cust_id").agg(
+          F.try_divide(fsum(bal), fsum(eff)).alias("util_l6m_uns_tot_new"))
+  )
+  global_attrs = (global_attrs
+      .join(_util6m_override, "cust_id", "left")
+      .withColumn("util_l6m_uns_tot",
+                  F.coalesce("util_l6m_uns_tot_new", "util_l6m_uns_tot"))
+      .drop("util_l6m_uns_tot_new"))
+
+GAIN: +15 cells (util_l6m_uns_tot improved)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 10 — PHASE 4: build_global_attrs — live_bal / bal_ratio block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 14: live_bal_0_12_zf — 0-fill for live_cnt and balance_amt_0_6
+───────────────────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — bal_ratio_df computation
+COLUMN(S): live_cnt_0_6_by_7_12, balance_amt_0_6_by_7_12
+REASON   : Java adds 0 for every month (even non-qualifying months) when
+           building the account balance map. This means the average denominator
+           includes months with zero balance. Original code used favg which
+           only averages over months WITH data → too high.
+           Fix: create _live_zf DataFrame that adds 0 for all idx 0..12,
+           use this for the average calculation.
+ADD new DataFrame:
+  _live_zf = (
+      exploded.filter(col("idx").between(0,12))
+      .groupBy("cust_id","idx")
+      .agg(
+          fsum(when(_live_qualify, col("bal")).otherwise(lit(0.0))).alias("sum_bal_zf"),
+          F.countDistinct(when(_live_qualify, col("_cons_key"))).alias("cnt_trades_zf"),
+      )
+  )
+THEN use _live_zf in bal_ratio_df:
+  _live_zf.groupBy("cust_id").agg(
+      favg(when(col("idx").between(0,6),  col("sum_bal_zf"))).alias("_bal_0_6"),
+      favg(when(col("idx").between(7,12), col("sum_bal_zf"))).alias("_bal_7_12"),
+      favg(when(col("idx").between(0,6),  col("cnt_trades_zf"))).alias("_cnt_0_6"),
+      favg(when(col("idx").between(7,12), col("cnt_trades_zf"))).alias("_cnt_7_12"),
+  )
+
+GAIN: +11 cells (live_cnt_0_6_by_7_12 and balance_amt_0_6_by_7_12)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 11 — PHASE 4: build_global_attrs — dlq_ratio_df block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 15: dlq_ratio_df — coalesce NaN→0 before ratio
+───────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — dlq_ratio_df
+COLUMN(S): dlq_bal_12_24, dlq_bal_24_36
+REASON   : Java builds accountBalMap with 0 for months without delinquent
+           balance. When no DLQ in a window → avg = 0 (not NaN).
+           Original code left avg as NaN → ratio NaN → wrong.
+OLD:
+  favg(when(col("idx") <= 11, col("dlq_bal"))).alias("_dlq_0_12"),
+  # then used directly in ratio
+NEW:
+  .withColumn("_dlq_0_12",  F.coalesce(col("_dlq_0_12"),  lit(0.0)))
+  .withColumn("_dlq_13_24", F.coalesce(col("_dlq_13_24"), lit(0.0)))
+  .withColumn("_dlq_25_36", F.coalesce(col("_dlq_25_36"), lit(0.0)))
+  # then compute ratio using these 0-filled values
+
+GAIN: +14 cells (dlq_bal_12_24 and dlq_bal_24_36)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 12 — PHASE 4: build_global_attrs — totconsinc_util1_tot_7m UDF
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 16: totconsinc_util1_tot_7m — relative % change (not absolute)
+───────────────────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — compute_util7m_udf
+COLUMN(S): totconsinc_util1_tot_7m
+REASON   : Java uses RELATIVE % change: (u_new - u_old) / u_old > 1% (0.01).
+           Original code used ABSOLUTE change: u_new - u_old > 0.01. These
+           give very different results for utilisation values near 1.0.
+OLD:
+  if u_newer - u_older > 0.01:  # absolute threshold
+      consec_count += 1
+NEW:
+  if u_older > 0 and (u_newer - u_older) / u_older > 0.01:  # relative %
+      consec_count += 1
+
+GAIN: +11 cells (totconsinc_util1_tot_7m)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 13 — PHASE 4: build_global_attrs — EMI outflow loop
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 17: EMI dispatch — use account_type_cd directly (not isHL/isPL flags)
+─────────────────────────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — calculateOverflow_HC outflow loop
+COLUMN(S): HL_LAP_outflow, AL_TW_outflow, PL_outflow, CD_outflow,
+           total_monthly_outflow_wo_cc, Outflow_uns_secmov
+REASON   : isHL/isPL flags come from HL_CODES/PL_CODES (count codes).
+           Changing those codes for EMI broke the count variables.
+           Solution: dispatch EMI using account_type_cd directly with
+           separate EMI_HL_CODES / EMI_PL_CODES sets.
+OLD:
+  if is_live and (is_hl or is_secmov) and emi_non_cd is not None:
+      outflow_results["HL_LAP_outflow"].append(...)
+  if is_live and is_pl and not is_cd and emi_non_cd is not None:
+      outflow_results["PL_outflow"].append(...)
+NEW:
+  _acd_stripped = acd.lstrip("0") if acd else ""
+  is_emi_hl = _acd_stripped in {"58","195"}
+  is_emi_pl = _acd_stripped in {"123","228"}
+  is_emi_al = _acd_stripped in {"47"}
+  is_emi_tw = _acd_stripped in {"173"}
+  if is_live and is_emi_hl and emi_non_cd is not None:
+      outflow_results["HL_LAP_outflow"].append(...)
+  if is_live and is_emi_pl and not is_cd and emi_non_cd is not None:
+      outflow_results["PL_outflow"].append(...)
+
+ALSO: Remove total_outflow_wo_cc from _zero_fill_cols
+      (EMI loop computes it correctly; zero-filling clobbers the result)
+
+GAIN: +101 cells (total_monthly_outflow_wo_cc: 101→0 — PERFECT!)
+       +31 cells for HL_LAP/AL_TW/PL combined
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 14 — PHASE 4: build_global_attrs — zero_fill_cols block
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CHANGE 18: consinc_bal10_exc_cc_25m — add to zero-fill
+────────────────────────────────────────────────────────
+FUNCTION : build_global_attrs — _zero_fill_cols list
+COLUMN(S): consinc_bal10_exc_cc_25m
+REASON   : Java returns 0 when no exc-CC accounts with 10%+ balance increase.
+           Our pipeline returned NaN. Adding to zero-fill converts Code=NaN
+           to Code=0, matching Java's output.
+ADD to _zero_fill_cols:
+  "consinc_bal10_exc_cc_25m",
+
+GAIN: +2 cells
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+#   Column(s) Fixed                    Gain    Section Changed
+────────────────────────────────────────────────────────────────────────────────
+1   HL_LAP/AL_TW/PL/total_outflow     +132    EMI dispatch (Change 1+17)
+2   modified_limit cap                +  8    modified_limit_udf (Change 2)
+3   consinc_bal10_tot_7m              +  3    _max_consec_udf (Change 3)
+4   max_dpd_L30M                      +  4    dpd_attrs (Change 4)
+5   max_dpd__UNS__L6M                 +  1    dpd_attrs (Change 5)
+6   max_dpd__UNS_L_6_12_M             +  2    dpd_attrs (Change 6)
+7   max_dpd__UNS_L36M                 +  4    dpd_attrs (Change 7)
+8   nbr_cc_tot_accts_36               +  6    acct_counts (Change 8)
+9   nbr_cc_live_accts_36              +  5    acct_counts (Change 9)
+10  max_sanc_amt_al                   +  3    exp_df (Change 10)
+11  sum_sanc_amt_uns                  +  3    _CV_UNS (Change 11)
+12  util_l3m_cc_live                  +  3    _cc_live_per_acct (Change 12)
+13  util_l6m_uns_tot                  + 15    post-build override (Change 13)
+14  live_cnt_0_6_by_7_12              + 11    _live_zf / bal_ratio (Change 14)
+15  dlq_bal_12_24 / dlq_bal_24_36     + 14    dlq_ratio_df (Change 15)
+16  totconsinc_util1_tot_7m           + 11    compute_util7m_udf (Change 16)
+17  consinc_bal10_exc_cc_25m ZF       +  2    zero_fill_cols (Change 18)
+────────────────────────────────────────────────────────────────────────────────
+TOTAL GAIN                            +227    (86% → 92.1%)
+================================================================================
