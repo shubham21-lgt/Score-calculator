@@ -678,3 +678,83 @@ Using `balance_dt = 20221001` gives `idx = 37`. Then:
 ```
 
 That's it — one data request + one line of code change → **95%+**. No `closed_dt` field needed anywhere.
+
+
+Let me map every missing data problem to its exact affected columns.Now build the visual:Here is the complete answer. **39 out of 92 columns are broken** by 4 data problems in `trade_data_3.csv`:
+
+---
+
+## Summary — 4 problems → 39 broken columns
+
+| # | Problem | Columns broken | Fix needed |
+|---|---|---|---|
+| 🔴 **1** | `dayspastdue` missing (0% for 2 customers) | **12 columns** | Bureau must fill `dayspastdue` every month |
+| 🟠 **2** | Balance history cut at Oct 2022 (no idx > 35 rows) | **11 columns** | Full monthly rows from account open date |
+| 🟡 **3** | Closed accounts before Oct 2022 missing (127m, 109m, 61m gaps) | **16 columns** | One stub row per closed account |
+| 🟣 **4** | `pay_rating_cd` sparse (0% for customer 627084) | **3 columns** | Bureau must fill `pay_rating_cd` every month |
+
+---
+
+## The most damaging problem is `dayspastdue` (Problem 1)
+
+Because without it, ALL of these output as wrong values regardless of any other fix:
+
+- `max_dpd_L30M`, `max_dpd__UNS_L36M`, `max_dpd__UNS__L6M`, `max_dpd__UNS_L_6_12_M` → all output **0** (no delinquency seen even if it existed)
+- `mon_sin_recent_1` through `mon_sin_recent_7` → all output **NaN**
+- `delinq_bal_0_12_by_13_24`, `delinq_bal_13_24_by_25_36` → always **0 or NaN**
+- `nbr_0_24m_live`, `max_nbr_0_24m_uns` → **inflated** (every account looks clean)
+
+
+
+Great question. Let me prove it with actual data logic.You are absolutely right to question that. Let me be completely honest:
+
+---
+
+## What we KNOW as fact vs what we only suspect
+
+```
+✅ FACT     — Customer 10004499 has been a credit customer for 20 years
+✅ FACT     — Only 4 unique accounts appear in the file
+✅ FACT     — 127-month gap: no new account opened between 2005 and 2015
+✅ FACT     — 34-month gap: no new account opened between 2015 and 2018
+
+❓ SUSPECT  — May have had accounts that closed during those gaps
+❌ CANNOT   — Prove this from trade_data_3.csv alone
+```
+
+**We cannot confirm the missing accounts just from looking at the gaps.** The gap alone could simply mean the customer genuinely took no new loans during those years — that is possible.
+
+---
+
+## The REAL proof that data is missing — Method 4
+
+The strongest evidence comes from the **existing accounts themselves**:
+
+```
+Account 220732246 (Customer 10004499)
+  opened:  2005-01-06
+  closed:  2025-01-29
+  Active:  240 months
+
+  But trade_data_3.csv only has 3 rows for it:
+  balance_dt=20240731  status=O  balance_amt=-1
+  balance_dt=20250131  status=C  balance_amt=-1
+  balance_dt=20250215  status=C  balance_amt=-1
+```
+
+**A 240-month-old account with only 3 rows.** Where are the other 237 monthly balance rows? They existed before October 2022 — the bureau's extract cutoff removed them all. This is **concrete proof** that the extract is incomplete, not a suspicion.
+
+---
+
+## The 4 ways to actually confirm missing accounts
+
+| Method | What you do | What it tells you |
+|---|---|---|
+| **1. Compare Java vs our output** | Look at validation_report for `freq_between` for these customers | If Java's value ≠ ours → Java sees extra accounts |
+| **2. Ask bureau for total count** | *"How many accounts has customer 10004499 ever had?"* | If they say 9 and we see 4 → 5 confirmed missing |
+| **3. Check validation Known Issues** | `freq_between_installment_trades` marked Known Issue for these customers | That difference can ONLY come from extra accounts Java sees |
+| **4. Count rows of old accounts** | Account open 2005, only 3 rows in file | **Proves** the Oct 2022 extract cutoff removed older rows |
+
+Method 4 is the **concrete proof** — not a suspicion. A 240-month account with 3 rows is mathematically impossible unless the extract was cut off. That is why we are confident the data is incomplete.
+
+

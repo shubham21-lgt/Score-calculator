@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Why Accuracy is Low — Columns Broken by Data Gaps</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600;700;800&display=swap');
+
+  :root {
+    --bg:      #0b0d12;
+    --surface: #111418;
+    --card:    #15181f;
+    --border:  #1c2030;
+    --dim:     #4a5270;
+    --text:    #c0c8de;
+
+    --red:     #f87171;  --red-bg:    rgba(248,113,113,0.08); --red-bd:    rgba(248,113,113,0.28);
+    --orange:  #fb923c;  --orange-bg: rgba(251,146,60,0.08);  --orange-bd: rgba(251,146,60,0.28);
+    --amber:   #fbbf24;  --amber-bg:  rgba(251,191,36,0.07);  --amber-bd:  rgba(251,191,36,0.25);
+    --green:   #34d399;  --green-bg:  rgba(52,211,153,0.07);  --green-bd:  rgba(52,211,153,0.22);
+    --blue:    #60a5fa;  --blue-bg:   rgba(96,165,250,0.07);  --blue-bd:   rgba(96,165,250,0.22);
+    --purple:  #a78bfa;  --purple-bg: rgba(167,139,250,0.08); --purple-bd: rgba(167,139,250,0.25);
+  }
+
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body {
+    background:var(--bg); color:var(--text);
+    font-family:'IBM Plex Sans',sans-serif;
+    font-size:13px; line-height:1.6;
+    padding:28px 22px 60px;
+  }
+
+  /* Header */
+  .hdr { margin-bottom:22px; padding-bottom:16px; border-bottom:1px solid var(--border); }
+  .hdr h1 { font-size:19px; font-weight:800; color:#fff; letter-spacing:-0.4px; }
+  .hdr p  { color:var(--dim); font-size:11px; margin-top:4px; font-family:'IBM Plex Mono',monospace; }
+
+  /* Root causes bar */
+  .causes { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:24px; }
+  .cause-badge {
+    display:flex; align-items:center; gap:8px;
+    padding:8px 14px; border-radius:8px; border:1px solid;
+    font-size:11px; font-weight:600; cursor:default;
+  }
+  .cause-num {
+    width:20px; height:20px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:11px; font-weight:800; color:#000; flex-shrink:0;
+  }
+  .c1 { background:var(--red-bg);    border-color:var(--red-bd);    color:var(--red);    }  .c1 .cause-num { background:var(--red); }
+  .c2 { background:var(--orange-bg); border-color:var(--orange-bd); color:var(--orange); }  .c2 .cause-num { background:var(--orange); }
+  .c3 { background:var(--amber-bg);  border-color:var(--amber-bd);  color:var(--amber);  }  .c3 .cause-num { background:var(--amber); }
+  .c4 { background:var(--purple-bg); border-color:var(--purple-bd); color:var(--purple); }  .c4 .cause-num { background:var(--purple); }
+
+  /* ── Column groups ── */
+  .section { margin-bottom:28px; }
+  .sect-hdr {
+    display:flex; align-items:center; gap:10px;
+    margin-bottom:10px;
+  }
+  .sect-hdr h2 { font-size:13px; font-weight:700; color:#fff; }
+  .sect-sub { font-size:11px; color:var(--dim); font-family:'IBM Plex Mono',monospace; }
+
+  .cols-grid {
+    display:grid;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap:8px;
+  }
+
+  .col-card {
+    border-radius:7px; border:1px solid; padding:10px 13px;
+    display:flex; flex-direction:column; gap:4px;
+  }
+  .col-name {
+    font-family:'IBM Plex Mono',monospace;
+    font-size:12px; font-weight:600; color:#fff;
+  }
+  .col-reason { font-size:11px; line-height:1.5; }
+  .col-cause  {
+    display:inline-flex; align-items:center; gap:5px;
+    font-size:10px; font-weight:600; margin-top:2px;
+    padding:2px 7px; border-radius:99px; width:fit-content;
+  }
+  .dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+
+  /* Card colours per cause */
+  .card-c1 { background:var(--red-bg);    border-color:var(--red-bd);    }
+  .card-c1 .col-reason { color:#fca5a5; }
+  .card-c1 .col-cause  { background:var(--red-bg);    border:1px solid var(--red-bd);    color:var(--red);    }
+  .card-c1 .dot        { background:var(--red); }
+
+  .card-c2 { background:var(--orange-bg); border-color:var(--orange-bd); }
+  .card-c2 .col-reason { color:#fdba74; }
+  .card-c2 .col-cause  { background:var(--orange-bg); border:1px solid var(--orange-bd); color:var(--orange); }
+  .card-c2 .dot        { background:var(--orange); }
+
+  .card-c3 { background:var(--amber-bg);  border-color:var(--amber-bd);  }
+  .card-c3 .col-reason { color:#fde68a; }
+  .card-c3 .col-cause  { background:var(--amber-bg);  border:1px solid var(--amber-bd);  color:var(--amber);  }
+  .card-c3 .dot        { background:var(--amber); }
+
+  .card-c4 { background:var(--purple-bg); border-color:var(--purple-bd); }
+  .card-c4 .col-reason { color:#c4b5fd; }
+  .card-c4 .col-cause  { background:var(--purple-bg); border:1px solid var(--purple-bd); color:var(--purple); }
+  .card-c4 .dot        { background:var(--purple); }
+
+  /* OK columns */
+  .card-ok { background:var(--green-bg); border-color:var(--green-bd); }
+  .card-ok .col-name   { color:var(--green); }
+  .card-ok .col-reason { color:#6ee7b7; font-size:11px; }
+  .card-ok .col-cause  { background:var(--green-bg); border:1px solid var(--green-bd); color:var(--green); }
+  .card-ok .dot        { background:var(--green); }
+
+  /* Summary strip */
+  .summary {
+    display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:10px; margin-bottom:28px;
+  }
+  .scard { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; }
+  .scard .sl { font-size:10px; text-transform:uppercase; letter-spacing:0.7px; color:var(--dim); margin-bottom:4px; font-family:'IBM Plex Mono',monospace; }
+  .scard .sv { font-size:26px; font-weight:800; color:#fff; font-family:'IBM Plex Sans',sans-serif; }
+  .sv.red    { color:var(--red); }
+  .sv.orange { color:var(--orange); }
+  .sv.amber  { color:var(--amber); }
+  .sv.green  { color:var(--green); }
+  .sv.purple { color:var(--purple); }
+  .scard .ss { font-size:10px; color:var(--dim); margin-top:2px; }
+
+  /* Fix table */
+  .fix-table { width:100%; border-collapse:collapse; margin-top:20px; }
+  .fix-table th {
+    background:#171c28; color:var(--dim); font-size:10px;
+    text-transform:uppercase; letter-spacing:0.9px; padding:9px 13px;
+    text-align:left; border-bottom:1px solid var(--border);
+    font-family:'IBM Plex Mono',monospace;
+  }
+  .fix-table td { padding:9px 13px; font-size:12px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .fix-table tr:last-child td { border-bottom:none; }
+  .fix-table tr:hover td { background:rgba(255,255,255,0.02); }
+  code { background:rgba(255,255,255,0.07); padding:1px 5px; border-radius:3px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#93c5fd; }
+
+  hr { border:none; border-top:1px solid var(--border); margin:24px 0; }
+  .sect-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin-bottom:12px; }
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <h1>Why Accuracy is Low — Columns Broken by Missing Data</h1>
+  <p>Source: trade_data_3.csv · 3 customers · 4 root causes → 39 of 92 columns affected</p>
+</div>
+
+<!-- Root causes -->
+<div class="causes">
+  <div class="cause-badge c1"><div class="cause-num">1</div> dayspastdue missing (0–8% filled)</div>
+  <div class="cause-badge c2"><div class="cause-num">2</div> Balance history cut at Oct 2022 (idx &gt; 35 = 0 rows)</div>
+  <div class="cause-badge c3"><div class="cause-num">3</div> Closed accounts missing (127m / 109m / 61m gaps)</div>
+  <div class="cause-badge c4"><div class="cause-num">4</div> pay_rating_cd sparse (0% for customer 627084)</div>
+</div>
+
+<!-- Summary -->
+<div class="summary">
+  <div class="scard"><div class="sl">Columns affected</div><div class="sv red">39</div><div class="ss">out of 92 total</div></div>
+  <div class="scard"><div class="sl">Due to DPD missing</div><div class="sv red">12</div><div class="ss">max_dpd, delinq, mon_sin</div></div>
+  <div class="scard"><div class="sl">Due to balance cutoff</div><div class="sv orange">11</div><div class="ss">consinc, balance_ratio, util</div></div>
+  <div class="scard"><div class="sl">Due to missing accts</div><div class="sv amber">16</div><div class="ss">freq_between, nbr_*, simul</div></div>
+  <div class="scard"><div class="sl">Due to pay_rating</div><div class="sv purple">3</div><div class="ss">nbr_0_0m, nbr_0_24m</div></div>
+  <div class="scard"><div class="sl">Columns correct</div><div class="sv green">53</div><div class="ss">data present and complete</div></div>
+</div>
+
+<hr>
+
+<!-- ═══ PROBLEM 1: dayspastdue ═══ -->
+<div class="section">
+  <div class="sect-hdr">
+    <div class="cause-badge c1" style="padding:5px 11px;font-size:11px;"><div class="cause-num" style="width:17px;height:17px;font-size:10px;">1</div> dayspastdue missing</div>
+    <div>
+      <div class="sect-hdr"><h2>DPD-based columns — 12 columns broken</h2></div>
+      <div class="sect-sub">dayspastdue: 0/267 rows for cust 627084 · 0/104 for 10004499 · 7/91 for 10003821</div>
+    </div>
+  </div>
+  <div class="cols-grid">
+    <div class="col-card card-c1">
+      <div class="col-name">max_dpd_L30M</div>
+      <div class="col-reason">Max DPD bucket in last 30 months. <strong>dayspastdue</strong> is used to compute the DPD bucket (0-7). No dayspastdue → bucket is always 0 → output is always 0. Wrong.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">max_dpd__UNS_L36M</div>
+      <div class="col-reason">Max DPD on unsecured accounts in 36m. Same issue — needs dayspastdue per row. All zero without it.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">max_dpd__UNS__L6M</div>
+      <div class="col-reason">Max DPD unsecured in last 6 months. Driven entirely by dayspastdue. Always 0 without data.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">max_dpd__UNS_L_6_12_M</div>
+      <div class="col-reason">Max DPD unsecured months 6–12. Needs dayspastdue for those months. Always 0 without it.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">max_dpd_sec0_live</div>
+      <div class="col-reason">DPD bucket on live secured accounts at current month. Needs dayspastdue at idx=0.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">mon_sin_recent_1 … mon_sin_recent_7</div>
+      <div class="col-reason">Months since most recent DPD bucket 1 through 7. Cannot compute without knowing which months had DPD &gt; 0.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">mon_sin_first_1 … mon_sin_first_7</div>
+      <div class="col-reason">Months since first occurrence of DPD bucket 1–7. Cannot compute without dayspastdue history.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">delinq_bal_0_12_by_13_24</div>
+      <div class="col-reason">Ratio of avg delinquent balance (0–12m) to (13–24m). DPD &gt; 0 marks a row as delinquent. Without dayspastdue, no rows are delinquent → ratio is 0 or NaN.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">delinq_bal_13_24_by_25_36</div>
+      <div class="col-reason">Same as above for 13–36m window. Both numerator and denominator need DPD data.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">nbr_0_0m_all</div>
+      <div class="col-reason">Count of accounts with DPD=0 at latest month. Without dayspastdue, every account appears to have DPD=0 → count is inflated.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">nbr_0_24m_live</div>
+      <div class="col-reason">Count of always DPD=0 live accounts in 24m. Needs 24 months of dayspastdue per account to identify consistently clean accounts.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+    <div class="col-card card-c1">
+      <div class="col-name">max_nbr_0_24m_uns</div>
+      <div class="col-reason">Max consecutive DPD=0 months on unsecured accounts. Needs month-by-month dayspastdue to count the streak.</div>
+      <div class="col-cause"><div class="dot"></div> dayspastdue missing</div>
+    </div>
+  </div>
+</div>
+
+<hr>
+
+<!-- ═══ PROBLEM 2: Balance history cut ═══ -->
+<div class="section">
+  <div class="sect-hdr">
+    <div class="cause-badge c2" style="padding:5px 11px;font-size:11px;"><div class="cause-num" style="width:17px;height:17px;font-size:10px;">2</div> Balance history cut at Oct 2022</div>
+    <div>
+      <div class="sect-hdr"><h2>Balance trend columns — 11 columns broken</h2></div>
+      <div class="sect-sub">Account 220732246 open 240m but has only 3 rows · All idx &gt; 35 rows absent</div>
+    </div>
+  </div>
+  <div class="cols-grid">
+    <div class="col-card card-c2">
+      <div class="col-name">consinc_bal5_cc_13m</div>
+      <div class="col-reason">Months with 5%+ CC balance increase in last 13m. Needs 13 monthly CC balance rows. Old CC rows before Oct 2022 are absent → streak starts from wrong baseline.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">consinc_bal10_tot_7m</div>
+      <div class="col-reason">Max consecutive months with 10%+ balance increase in 7m. Month-on-month comparison needs prior month's balance. Missing old rows = wrong month 1 baseline.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">consinc_bal10_exc_cc_25m</div>
+      <div class="col-reason">25-month consecutive balance increase check (excl CC). The full 25-month window goes back to before Oct 2022. Missing rows = only partial window available.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">totconsinc_bal10_exc_cc_25m</div>
+      <div class="col-reason">Total count of 25m consecutive increase events. Same issue — needs full 25m history to count correctly.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">totconsinc_bal10_exc_cc_7m</div>
+      <div class="col-reason">7-month consecutive count. Scoring date Sep 2025 → 7m window = Feb 2025 to Sep 2025. Within range BUT old account balances as comparison base still missing.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">totconsinc_bal5_exc_cc_7m</div>
+      <div class="col-reason">5% streak in 7m (excl CC). Same as above — old balance rows needed for streak baseline.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">totconsinc_util1_tot_7m</div>
+      <div class="col-reason">Utilisation increase streak count in 7m. Needs 7 months of utilisation. Util = balance ÷ limit — old balance rows affect the starting utilisation level.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">mon_since_max_bal_l24m_uns</div>
+      <div class="col-reason">Months since max UNS balance in last 24m. The maximum balance might have occurred in months 25–37 (before Oct 2022) which are absent from the extract.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">balance_amt_0_6_by_7_12</div>
+      <div class="col-reason">Ratio of avg balance months 0–6 vs 7–12. The 7–12 window is Sep 2024 to Mar 2025 — well within range. BUT for old accounts, balance history may differ from what Java saw.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">live_cnt_0_6_by_7_12</div>
+      <div class="col-reason">Ratio of live account count 0–6m vs 7–12m. Same window issue — closed accounts before Oct 2022 affect the count in older months.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+    <div class="col-card card-c2">
+      <div class="col-name">avg_b_1to6_by_7_12_agri</div>
+      <div class="col-reason">Agri balance ratio for months 1–6 vs 7–12. Agri accounts older than 35m have no balance history pre-Oct 2022.</div>
+      <div class="col-cause"><div class="dot"></div> Balance history cut at Oct 2022</div>
+    </div>
+  </div>
+</div>
+
+<hr>
+
+<!-- ═══ PROBLEM 3: Missing closed accounts ═══ -->
+<div class="section">
+  <div class="sect-hdr">
+    <div class="cause-badge c3" style="padding:5px 11px;font-size:11px;"><div class="cause-num" style="width:17px;height:17px;font-size:10px;">3</div> Closed accounts missing</div>
+    <div>
+      <div class="sect-hdr"><h2>Frequency &amp; count columns — 16 columns broken</h2></div>
+      <div class="sect-sub">127m gap (cust 10004499) · 109m gap (cust 627084) · 61m gap (cust 10003821)</div>
+    </div>
+  </div>
+  <div class="cols-grid">
+    <div class="col-card card-c3">
+      <div class="col-name">freq_between_installment_trades</div>
+      <div class="col-reason">Average months between consecutive instalment account openings. Missing closed accounts = fewer open dates = wrong average gap. A 127m gap with no accounts in between inflates this badly.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">freq_between_accts_unsec_wo_cc</div>
+      <div class="col-reason">Average gap between UNS non-CC account openings. Same issue — missing old PL/AL accounts that closed before Oct 2022 remove open dates from the calculation.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">freq_between_accts_all</div>
+      <div class="col-reason">Average gap across all account types. Every missing closed account removes one open date from the sequence, distorting the average.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_tot_accts_36</div>
+      <div class="col-reason">Total accounts reported in last 36 months. Accounts that closed before Oct 2022 but were active within 36m of scoring are not in the file — undercounted.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_pl_tot_accts_36</div>
+      <div class="col-reason">Personal loan accounts in 36m window. Any PL that closed before Oct 2022 but opened within 36m of scoring = missing. Count is too low.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_cc_tot_accts_36</div>
+      <div class="col-reason">CC accounts in 36m. Customer 627084 had a CC open since 2008 with 109m gap — other CC accounts during that gap are missing.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_cc_live_accts_36</div>
+      <div class="col-reason">Live CC accounts in 36m. If a CC closed just before Oct 2022 it was still "live" within the 36m window from scoring — but absent from file.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_comsec_tot_accts_36</div>
+      <div class="col-reason">Commercial secured accounts in 36m. Same logic — any ComSec accounts closed before Oct 2022 within the 36m window are missing.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_comuns_tot_accts_36</div>
+      <div class="col-reason">Commercial unsecured accounts in 36m. Missing closed ComUns accounts → count too low.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">nbr_al_tot_accts_36</div>
+      <div class="col-reason">Auto loan accounts in 36m. Missing AL accounts that closed before Oct 2022 → undercounted.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">max_simul_unsec</div>
+      <div class="col-reason">Peak number of simultaneously active UNS accounts in any month. Missing closed accounts means some months had more active accounts than we can see — peak is underestimated.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">max_simul_unsec_wo_cc</div>
+      <div class="col-reason">Peak simultaneous UNS excluding CC. Missing PL/AL accounts that overlapped with visible accounts means the true peak is higher than we compute.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">max_simul_unsec_wo_cc_inc_gl</div>
+      <div class="col-reason">Max simul UNS including gold loans. Same issue — missing accounts understate the peak simultaneous count.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">max_simul_pl_cd</div>
+      <div class="col-reason">Max simultaneous PL + CD accounts. Missing closed PL accounts in the gap period means the true peak overlap is understated.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">min_mob_uns_wo_cc_36</div>
+      <div class="col-reason">Minimum MOB of UNS non-CC accounts in 36m. Missing recently-opened-and-closed accounts may have had lower MOB than the youngest visible account.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+    <div class="col-card card-c3">
+      <div class="col-name">mon_since_last_acct_open</div>
+      <div class="col-reason">Months since most recent account opened. If the most recently opened account closed before Oct 2022 and was more recent than any visible account — this value is wrong.</div>
+      <div class="col-cause"><div class="dot"></div> Closed accounts missing</div>
+    </div>
+  </div>
+</div>
+
+<hr>
+
+<!-- ═══ PROBLEM 4: pay_rating_cd ═══ -->
+<div class="section">
+  <div class="sect-hdr">
+    <div class="cause-badge c4" style="padding:5px 11px;font-size:11px;"><div class="cause-num" style="width:17px;height:17px;font-size:10px;">4</div> pay_rating_cd sparse</div>
+    <div>
+      <div class="sect-hdr"><h2>Payment behaviour columns — 3 columns broken</h2></div>
+      <div class="sect-sub">0% filled for customer 627084 · 33% for 10003821</div>
+    </div>
+  </div>
+  <div class="cols-grid">
+    <div class="col-card card-c4">
+      <div class="col-name">nbr_0_0m_all</div>
+      <div class="col-reason">Count of accounts with pay_rating_cd = 0 at current month. Without this field, cannot identify which accounts are on-time vs overdue.</div>
+      <div class="col-cause"><div class="dot"></div> pay_rating_cd missing</div>
+    </div>
+    <div class="col-card card-c4">
+      <div class="col-name">nbr_0_24m_live</div>
+      <div class="col-reason">Live accounts always pay_rating=0 in last 24m. Need 24 months of pay_rating_cd per account to confirm consistently clean payment history.</div>
+      <div class="col-cause"><div class="dot"></div> pay_rating_cd missing</div>
+    </div>
+    <div class="col-card card-c4">
+      <div class="col-name">max_nbr_0_24m_uns</div>
+      <div class="col-reason">Max consecutive months with pay_rating=0 on UNS accounts. Needs month-by-month pay_rating_cd to count the streak. Without it, streak is always inflated or wrong.</div>
+      <div class="col-cause"><div class="dot"></div> pay_rating_cd missing</div>
+    </div>
+  </div>
+</div>
+
+<hr>
+
+<!-- What to request -->
+<div class="sect-label">What to request from bureau to fix all 39 columns</div>
+<table class="fix-table">
+  <thead>
+    <tr><th>Problem</th><th>Field to request</th><th>Columns it fixes</th><th>Priority</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="color:var(--red);">● dayspastdue missing</td>
+      <td><code>dayspastdue</code> filled for every monthly row</td>
+      <td>12 columns: max_dpd_*, mon_sin_*, delinq_bal_*, nbr_0_*</td>
+      <td style="color:var(--red);font-weight:700;">Critical</td>
+    </tr>
+    <tr>
+      <td style="color:var(--orange);">● Balance history cut</td>
+      <td>All monthly rows from account open date (not just post Oct 2022). Or min: <code>balance_dt</code> rows going back 36m from scoring date</td>
+      <td>11 columns: consinc_*, balance_amt_ratio, mon_since_max_bal</td>
+      <td style="color:var(--orange);font-weight:700;">High</td>
+    </tr>
+    <tr>
+      <td style="color:var(--amber);">● Missing closed accounts</td>
+      <td>One stub row per closed account with <code>open_dt</code>, <code>closed_dt</code>, <code>account_type_cd</code>, <code>balance_dt = closed_dt</code>, <code>balance_amt = 0</code>, <code>account_status_cd = C</code></td>
+      <td>16 columns: freq_between_*, nbr_*_tot_accts, max_simul_*</td>
+      <td style="color:var(--amber);font-weight:700;">High</td>
+    </tr>
+    <tr>
+      <td style="color:var(--purple);">● pay_rating_cd sparse</td>
+      <td><code>pay_rating_cd</code> filled for every monthly row alongside dayspastdue</td>
+      <td>3 columns: nbr_0_0m_all, nbr_0_24m_live, max_nbr_0_24m_uns</td>
+      <td style="color:var(--purple);font-weight:700;">Medium</td>
+    </tr>
+  </tbody>
+</table>
+
+</body>
+</html>

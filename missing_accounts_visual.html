@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Missing Closed Accounts — Trade Data Analysis</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;700;800&display=swap');
+
+  :root {
+    --bg:       #0d0f14;
+    --surface:  #13161e;
+    --border:   #1e2330;
+    --muted:    #3a3f52;
+    --text:     #c8cfe0;
+    --dim:      #5c6478;
+
+    --green:    #22c55e;
+    --green-bg: rgba(34,197,94,0.08);
+    --green-bd: rgba(34,197,94,0.25);
+
+    --amber:    #f59e0b;
+    --amber-bg: rgba(245,158,11,0.08);
+    --amber-bd: rgba(245,158,11,0.25);
+
+    --red:      #ef4444;
+    --red-bg:   rgba(239,68,68,0.10);
+    --red-bd:   rgba(239,68,68,0.35);
+
+    --blue:     #60a5fa;
+    --blue-bg:  rgba(96,165,250,0.08);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 32px 24px 60px;
+    min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 28px;
+  }
+  .header h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 800;
+    color: #fff;
+    letter-spacing: -0.5px;
+  }
+  .header p {
+    color: var(--dim);
+    margin-top: 4px;
+    font-size: 12px;
+  }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 28px;
+    padding: 14px 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--text);
+  }
+  .dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot-red    { background: var(--red); }
+  .dot-green  { background: var(--green); }
+  .dot-amber  { background: var(--amber); }
+
+  /* ── Customer block ── */
+  .customer-block {
+    margin-bottom: 36px;
+  }
+  .cust-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+  .cust-id {
+    font-family: 'Syne', sans-serif;
+    font-size: 16px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .cust-tag {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    border: 1px solid var(--muted);
+    color: var(--dim);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  .missing-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background: var(--red-bg);
+    border: 1px solid var(--red-bd);
+    color: var(--red);
+    letter-spacing: 0.3px;
+  }
+
+  /* ── Table ── */
+  .tbl-wrap {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  thead th {
+    background: #1a1e28;
+    color: var(--dim);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 600;
+    padding: 9px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody tr {
+    border-bottom: 1px solid var(--border);
+    transition: background 0.15s;
+  }
+  tbody tr:last-child { border-bottom: none; }
+  tbody td {
+    padding: 9px 14px;
+    font-size: 12px;
+    vertical-align: middle;
+  }
+
+  /* Row states */
+  tr.row-missing {
+    background: var(--red-bg);
+  }
+  tr.row-missing td { color: #fca5a5; }
+  tr.row-missing:hover { background: rgba(239,68,68,0.15); }
+
+  tr.row-visible-open {
+    background: transparent;
+  }
+  tr.row-visible-open:hover { background: var(--blue-bg); }
+
+  tr.row-visible-closed {
+    background: var(--amber-bg);
+  }
+  tr.row-visible-closed td { color: #fcd34d; }
+  tr.row-visible-closed:hover { background: rgba(245,158,11,0.13); }
+
+  /* Status pill */
+  .pill {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 99px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+  .pill-missing {
+    background: var(--red-bg);
+    border: 1px solid var(--red-bd);
+    color: var(--red);
+  }
+  .pill-open {
+    background: rgba(96,165,250,0.10);
+    border: 1px solid rgba(96,165,250,0.25);
+    color: var(--blue);
+  }
+  .pill-closed-ok {
+    background: var(--amber-bg);
+    border: 1px solid var(--amber-bd);
+    color: var(--amber);
+  }
+
+  /* Gap cell */
+  .gap-big  { color: var(--red);   font-weight: 700; }
+  .gap-med  { color: var(--amber); }
+  .gap-ok   { color: var(--green); }
+  .gap-dash { color: var(--muted); }
+
+  /* Warning icon */
+  .warn { color: var(--red); margin-right: 4px; font-size: 11px; }
+  .info { color: var(--blue); font-size: 10px; }
+
+  /* ── Explanation callout ── */
+  .callout {
+    margin-top: 10px;
+    padding: 12px 14px;
+    border-left: 3px solid var(--red);
+    background: rgba(239,68,68,0.05);
+    border-radius: 0 6px 6px 0;
+    font-size: 11px;
+    color: #fca5a5;
+    line-height: 1.7;
+  }
+  .callout strong { color: var(--red); }
+  .callout .ok    { color: var(--green); }
+
+  /* ── Summary grid ── */
+  .summary {
+    margin-top: 36px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--dim);
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-family: 'Syne', sans-serif;
+    font-size: 26px;
+    font-weight: 800;
+    color: #fff;
+  }
+  .stat-value.red   { color: var(--red); }
+  .stat-value.green { color: var(--green); }
+  .stat-value.amber { color: var(--amber); }
+  .stat-sub {
+    font-size: 10px;
+    color: var(--dim);
+    margin-top: 2px;
+  }
+
+  /* ── Fix box ── */
+  .fix-box {
+    margin-top: 28px;
+    padding: 16px 18px;
+    border: 1px solid var(--green-bd);
+    background: var(--green-bg);
+    border-radius: 8px;
+  }
+  .fix-box h3 {
+    font-family: 'Syne', sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--green);
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .fix-step {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    color: var(--text);
+    align-items: flex-start;
+  }
+  .step-num {
+    background: var(--green);
+    color: #000;
+    font-weight: 700;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  code {
+    background: rgba(255,255,255,0.07);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #93c5fd;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Missing Closed Accounts — Why Accuracy is Stuck at 92.1%</h1>
+  <p>Real accounts from trade_data.csv · Scoring date: Sep 2025 · Oct 2022 = bureau extract cutoff</p>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><div class="dot dot-red"></div> <strong>🔴 MISSING FROM PIPELINE</strong> — closed BEFORE Oct 2022, has ZERO rows in trade_data.csv</div>
+  <div class="legend-item"><div class="dot dot-amber"></div> Closed after Oct 2022 — visible in pipeline</div>
+  <div class="legend-item"><div class="dot dot-green"></div> Open account — visible in pipeline</div>
+</div>
+
+<!-- ══════════════════════ CUSTOMER 4979217 ══════════════════════ -->
+<div class="customer-block">
+  <div class="cust-header">
+    <span class="cust-id">Customer 4979217</span>
+    <span class="cust-tag">36 accounts visible</span>
+    <span class="missing-badge">⚠ 1 account MISSING</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>cons_acct_key</th><th>type_cd</th>
+          <th>open_dt</th><th>closed_dt</th><th>month_gap</th><th>pipeline status</th><th>note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="row-visible-open"><td>1</td><td>2970859</td><td>5 (CC)</td><td>2003-03-25</td><td>Still Open</td><td class="gap-big">270m</td><td><span class="pill pill-open">Visible · Open</span></td><td class="info">old account, still active</td></tr>
+        <tr class="row-visible-open"><td>2</td><td>197445976</td><td>123 (PL)</td><td>2004-05-31</td><td>Still Open</td><td class="gap-big">256m</td><td><span class="pill pill-open">Visible · Open</span></td><td class="info">oldest installment acc</td></tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>3</td>
+          <td>2783024213</td><td>195 (HL)</td>
+          <td>2017-04-30</td><td>2019-04-12</td>
+          <td class="gap-big">24m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Apr 2019 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-visible-closed"><td>4</td><td>2707968976</td><td>58 (HL)</td><td>2019-04-12</td><td>2023-03-09</td><td class="gap-med">47m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td class="info">closed after Oct 2022</td></tr>
+        <tr class="row-visible-closed"><td>5</td><td>2423270519</td><td>123 (PL)</td><td>2019-08-30</td><td>2023-05-11</td><td class="gap-med">45m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>6</td><td>2632462829</td><td>123 (PL)</td><td>2020-02-25</td><td>Still Open</td><td class="gap-ok">67m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>7</td><td>3181541765</td><td>123 (PL)</td><td>2021-03-10</td><td>Still Open</td><td class="gap-ok">54m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>8</td><td>6853698122</td><td>123 (PL)</td><td>2025-01-25</td><td>Still Open</td><td class="gap-ok">8m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <strong>Impact on freq_between_installment_trades:</strong><br>
+    We see installment account <code>197445976</code> (opened 2004) then next one in 2019 → gap = <strong style="color:var(--red)">183 months</strong>.<br>
+    Java also sees account <code>2783024213</code> (opened 2017, closed 2019) in between → fills the gap → Java gets smaller average.<br>
+    <span class="ok">Our value: 17.8m · Java value: 16.6m · Difference caused by this 1 missing account.</span>
+  </div>
+</div>
+
+<!-- ══════════════════════ CUSTOMER 1122607 ══════════════════════ -->
+<div class="customer-block">
+  <div class="cust-header">
+    <span class="cust-id">Customer 1122607</span>
+    <span class="cust-tag">4 accounts visible</span>
+    <span class="missing-badge">⚠ 1 account MISSING</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>cons_acct_key</th><th>type_cd</th>
+          <th>open_dt</th><th>closed_dt</th><th>month_gap</th><th>pipeline status</th><th>note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>1</td>
+          <td>1850764823</td><td>5 (CC)</td>
+          <td>1998-12-08</td><td>2022-09-22</td>
+          <td class="gap-big">285m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Sep 2022 → balance_dt=Sep 2022 → idx=36 → filtered out</strong></td>
+        </tr>
+        <tr class="row-visible-open"><td>2</td><td>29264231</td><td>5 (CC)</td><td>2010-06-19</td><td>Still Open</td><td class="gap-big">183m</td><td><span class="pill pill-open">Visible · Open</span></td><td class="info">24-yr old CC, still active</td></tr>
+        <tr class="row-visible-closed"><td>3</td><td>5739470108</td><td>184</td><td>2024-02-20</td><td>2024-09-02</td><td class="gap-ok">7m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>4</td><td>6674387256</td><td>5 (CC)</td><td>2024-12-01</td><td>Still Open</td><td class="gap-ok">9m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <strong>Special case:</strong> Account <code>1850764823</code> IS in trade_data.csv BUT its last balance_dt = <code>20221130</code> → idx = 36 → <strong style="color:var(--red)">dropped by current filter (≤ 35)</strong>.<br>
+    This is the ONE case where <span class="ok">just changing the filter to ≤ 59 would fix it</span> — no new data needed from bureau.<br>
+    This account was open since 1998 and closed Sep 2022 — 285 months of history invisible to pipeline.
+  </div>
+</div>
+
+<!-- ══════════════════════ CUSTOMER 2600085 ══════════════════════ -->
+<div class="customer-block">
+  <div class="cust-header">
+    <span class="cust-id">Customer 2600085</span>
+    <span class="cust-tag">10 accounts visible</span>
+    <span class="missing-badge">⚠ 2 accounts MISSING</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>cons_acct_key</th><th>type_cd</th>
+          <th>open_dt</th><th>closed_dt</th><th>month_gap</th><th>pipeline status</th><th>note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="row-visible-open"><td>1</td><td>3037048394</td><td>5 (CC)</td><td>2001-11-26</td><td>2025-08-14</td><td class="gap-big">285m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td class="info">closed after Oct 2022</td></tr>
+        <tr class="row-visible-open"><td>2</td><td>208063129</td><td>5 (CC)</td><td>2006-11-03</td><td>Still Open</td><td class="gap-big">226m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>3</td>
+          <td>2032444385</td><td>5 (CC)</td>
+          <td>2017-12-18</td><td>2020-01-20</td>
+          <td class="gap-med">25m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Jan 2020 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>4</td>
+          <td>2547437997</td><td>5 (CC)</td>
+          <td>2017-12-18</td><td>2022-08-04</td>
+          <td class="gap-big">56m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Aug 2022 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-visible-closed"><td>5</td><td>1608199174</td><td>5 (CC)</td><td>2018-01-13</td><td>2024-04-29</td><td class="gap-med">75m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>6</td><td>1813412103</td><td>195 (HL)</td><td>2018-06-29</td><td>Still Open</td><td class="gap-ok">87m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <strong>2 CC accounts completely absent from CSV:</strong><br>
+    Accounts <code>2032444385</code> and <code>2547437997</code> both opened Dec 2017 — one closed Jan 2020, one closed Aug 2022.<br>
+    These affect <strong style="color:var(--red)">consinc_bal5_cc_13m</strong> (13-month CC balance streak) and <strong style="color:var(--red)">nbr_cc_tot_accts_36</strong> counts.<br>
+    Java counts both; we count neither → variable values differ.
+  </div>
+</div>
+
+<!-- ══════════════════════ CUSTOMER 12819093 ══════════════════════ -->
+<div class="customer-block">
+  <div class="cust-header">
+    <span class="cust-id">Customer 12819093</span>
+    <span class="cust-tag">11 accounts visible</span>
+    <span class="missing-badge">⚠ 6 accounts MISSING</span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th><th>cons_acct_key</th><th>type_cd</th>
+          <th>open_dt</th><th>closed_dt</th><th>month_gap</th><th>pipeline status</th><th>note</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>1</td>
+          <td>208965918</td><td>5 (CC)</td>
+          <td>2012-02-15</td><td>2022-08-03</td>
+          <td class="gap-big">126m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>10-yr old CC, closed Aug 2022 → NO ROWS</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>2</td>
+          <td>1849237416</td><td>5 (CC)</td>
+          <td>2018-07-31</td><td>2021-10-04</td>
+          <td class="gap-med">39m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Oct 2021 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>3</td>
+          <td>3202624095</td><td>999</td>
+          <td>2021-03-19</td><td>2022-04-30</td>
+          <td class="gap-ok">13m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Apr 2022 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>4</td>
+          <td>3202624508</td><td>195 (HL)</td>
+          <td>2021-03-20</td><td>2022-04-30</td>
+          <td class="gap-ok">13m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Apr 2022 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>5</td>
+          <td>3797463759</td><td>999</td>
+          <td>2022-01-29</td><td>2022-08-31</td>
+          <td class="gap-ok">7m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Aug 2022 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-missing">
+          <td><span class="warn">⚠</span>6</td>
+          <td>3797461822</td><td>195 (HL)</td>
+          <td>2022-02-01</td><td>2022-08-31</td>
+          <td class="gap-ok">6m</td>
+          <td><span class="pill pill-missing">🔴 MISSING</span></td>
+          <td><strong>Closed Aug 2022 → NO ROWS in CSV</strong></td>
+        </tr>
+        <tr class="row-visible-closed"><td>7</td><td>4174905486</td><td>221</td><td>2022-06-15</td><td>2025-06-09</td><td class="gap-ok">36m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td class="info">closed after Oct 2022</td></tr>
+        <tr class="row-visible-closed"><td>8</td><td>4531005204</td><td>58 (HL)</td><td>2022-11-29</td><td>2025-07-31</td><td class="gap-ok">32m</td><td><span class="pill pill-closed-ok">Visible · Closed</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>9</td><td>4959979304</td><td>58 (HL)</td><td>2023-05-17</td><td>Still Open</td><td class="gap-ok">28m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+        <tr class="row-visible-open"><td>10</td><td>4959988660</td><td>195 (HL)</td><td>2023-05-18</td><td>Still Open</td><td class="gap-ok">28m</td><td><span class="pill pill-open">Visible · Open</span></td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <strong>Most affected customer — 6 accounts completely missing:</strong><br>
+    Accounts 1-6 all closed before Oct 2022. The oldest (<code>208965918</code>) was a 10-year CC account closed Aug 2022.<br>
+    These 6 missing accounts affect: <strong style="color:var(--red)">freq_between_installment_trades, consinc_bal5_cc_13m, nbr_cc_tot_accts_36, max_simul_unsec</strong>.<br>
+    Java counts all 6; our pipeline sees 0 of them → multiple variables wrong for this customer.
+  </div>
+</div>
+
+<!-- ══════════════════════ SUMMARY ══════════════════════ -->
+<div class="summary">
+  <div class="stat-card">
+    <div class="stat-label">Missing accounts (these 4 customers)</div>
+    <div class="stat-value red">10</div>
+    <div class="stat-sub">All closed before Oct 2022</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Visible accounts (same 4 customers)</div>
+    <div class="stat-value green">67</div>
+    <div class="stat-sub">All have balance_dt after Oct 2022</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Current accuracy</div>
+    <div class="stat-value amber">92.1%</div>
+    <div class="stat-sub">8,562 / 9,292 exact matches</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Target accuracy</div>
+    <div class="stat-value">95%+</div>
+    <div class="stat-sub">Needs bureau closed account data</div>
+  </div>
+</div>
+
+<!-- ══════════════════════ FIX ══════════════════════ -->
+<div class="fix-box">
+  <h3>✅ What needs to be done</h3>
+  <div class="fix-step">
+    <div class="step-num">1</div>
+    <div>Ask bureau: <em>"For these 100 customers, provide one stub row per account that closed before Oct 2022. Set <code>balance_dt = last_reporting_date</code>, <code>balance_amt = 0</code>, <code>account_status_cd = C</code>. Keep original <code>open_dt</code>."</em></div>
+  </div>
+  <div class="fix-step">
+    <div class="step-num">2</div>
+    <div>Append those stub rows to <code>trade_data.csv</code> (same 24-column format — no code changes to pipeline logic).</div>
+  </div>
+  <div class="fix-step">
+    <div class="step-num">3</div>
+    <div>Change ONE line in <code>build_fact2</code>: <code>.filter(month_diff &lt;= 35)</code> → <code>.filter(month_diff &lt;= 59)</code> so the new stub rows (idx 36-59) pass through.</div>
+  </div>
+  <div class="fix-step">
+    <div class="step-num">4</div>
+    <div>Re-run pipeline → expected accuracy: <strong>95%+</strong></div>
+  </div>
+</div>
+
+</body>
+</html>
