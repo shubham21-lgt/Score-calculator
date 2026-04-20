@@ -3,7 +3,7 @@
 # VERSION: con_14  (all product_mapping + bank_mapping fixes applied)
 # =============================================================================
 print("=" * 60)
-print("  RUNNING con_56.py")
+print("  RUNNING con_52.py")
 
 # ===========================================================================
 # OUTPUT MODE FLAG
@@ -381,77 +381,74 @@ def build_fact2(trade_df, acct_map, prod_map, bank_map):
 
 @udf(IntegerType())
 def dpd_new_udf(dayspastdue, pay_rating_cd, suit_filed, wo_settled, balance_amt):
-    """Normalised DPD bucket 0-7. Mirrors ScoreCardHelperV4.getDpd_new() exactly.
-    
-    Java L4283: paddedWOST = leftPad(wOST_String, 3, '0') — '0' → '000', '2' → '002'
-    Java L4306: wostCond = paddedWOST == '000'  → dpd=6 branch
-    Java L4289: cond4 = getAllWOSStatusCodes().contains(paddedWOST) → dpd=7 branch
-                getAllWOSStatusCodes = {002,003,004,006,008,009,013,014,015,016,017}
-    
-    KEY BUGS FIXED:
-    - WO='0': Java treats as '000' (valid code, wostCond=True → dpd=6)
-              Old code: _clean('0') returned '' (treated as sentinel) → dpd=0
-    - WOS set: Java set is {002,003,004,006,008,009,013,014,015,016,017}
-               Old set included 005,007,010,011,012 and missed 016,017
-    """
-    try: bal = float(balance_amt) if balance_amt is not None else -1.0
-    except: bal = -1.0
-    try: dpd = int(float(dayspastdue)) if dayspastdue is not None else -1
-    except: dpd = -1
-    pr = str(pay_rating_cd).strip() if pay_rating_cd is not None else ''
+    """Normalised DPD bucket 0-7. Mirrors ScoreCardHelperV4.getDpd_new()."""
+    bal = float(balance_amt) if balance_amt is not None else -1.0
+    dpd = int(dayspastdue)   if dayspastdue  is not None else -1
+    pr  = str(pay_rating_cd).strip() if pay_rating_cd is not None else ""
 
-    # Java: only None/empty string and truly missing → skip WO check
-    # '0' is a VALID WO code that pads to '000' (wostCond)
-    # Sentinels: None, empty, -1, negative, 99/099/999 (not applicable)
-    def _parse_wo(val):
-        if val is None: return ''
-        s = str(val).strip()
-        if s.lower() in ('', 'nan', 'none', 'null'): return ''
+    def _clean(val):
+        """Return empty string for missing/sentinel values, else return stripped string.
+        Sentinel values in this dataset: None, NaN, '0', '-1', '0.0', '-1.0'
+        WO/SFW integer 0 means 'not set', -1 means 'not applicable'.
+        Neither should trigger any WO code rule — treat both as missing.
+        """
+        if val is None: return ""
         try:
-            fv = float(s)
-            if _math.isnan(fv): return ''
-            if fv < 0: return ''          # -1 = not applicable
-            # 99/099/999 = sentinel "not applicable"
-            if fv in (99, 999): return ''
-            # 0 IS a valid code → '000' in Java
-            return str(int(fv))           # '0' stays '0', '2' stays '2', etc.
-        except: pass
-        return s if s not in ('nan','none','null') else ''
+            fv = float(val)
+            if _math.isnan(fv): return ""
+            # Integer 0 = "not set", -1 = "not applicable" — both are sentinels
+            if fv <= 0: return ""
+        except (ValueError, TypeError): pass
+        s = str(val).strip()
+        return "" if s.lower() in ("", "nan", "none", "null", "0", "-1", "0.0", "-1.0") else s
 
-    wo_raw = _parse_wo(wo_settled)
-    wo = wo_raw.zfill(3) if wo_raw else ''  # Java: leftPad(wOST, 3, '0')
-
-    # Java getAllWOSStatusCodes = {002,003,004,006,008,009,013,014,015,016,017}
-    # Note: 005 (MISSING from Java set), 007, 010, 011, 012 also absent; 016, 017 present
-    _WOS_CODES = {'002','003','004','006','008','009','013','014','015','016','017'}
-
-    wost_cond = (wo == '000')   # Java L4306: wostCond = paddedWOST == "000"
-    cond4     = wo in _WOS_CODES  # Java L4289: getAllWOSStatusCodes().contains()
+    wo_raw = _clean(wo_settled)
+    # GENERIC FIX: sentinel value 99 = "not applicable" in Indian bureau data
+    # Must not trigger any WO rule (same as -1 or 0)
+    if wo_raw in {"99", "099", "999"}:
+        wo_raw = ""
+    wo     = wo_raw.zfill(3) if wo_raw else ""
 
     if bal <= 500:
         return 0
-    # main1 → dpd=7
-    if dpd > 720 or (pr == 'L' and dpd == -1) or cond4:
+    if dpd > 720:
         return 7
-    # main2 → dpd=6: cond5 OR (pr in {L,D} AND dpd==-1) OR wostCond
-    if (361 <= dpd <= 720) or (pr in {'L','D'} and dpd == -1) or wost_cond:
+    if pr == "L" and dpd == -1:
+        return 7
+    if wo and wo in {"002","003","004","005","006","007","008","009",
+                     "010","011","012","013","014","015"}:
+        return 7
+    if 361 <= dpd <= 720:
         return 6
-    # main3 → dpd=5
-    if (181 <= dpd <= 360) or (pr in {'L','D'} and dpd == -1) or wost_cond:
+    if pr in {"L","D"} and dpd == -1:
+        return 6
+    if wo == "000" and bal > 500:
+        return 6
+    if 181 <= dpd <= 360:
         return 5
-    # main4 → dpd=4
-    if (91 <= dpd <= 180) or (pr in {'L','B','D'} and dpd == -1) or wost_cond:
+    if pr in {"D","B"} and dpd == -1 and wo in {"002","003"}:
+        return 5
+    if 91 <= dpd <= 180:
         return 4
-    # main5 → dpd=3
-    if (61 <= dpd <= 90) or (pr == 'M' and dpd == -1):
+    if pr in {"L","B","D"} and dpd == -1:
+        return 4
+    # pay_rating_cd="S" = Standard/Sub-Standard in Indian bureau.
+    # org_car logic: "S" maps to main8 (dpd_new=0) — standard performing account.
+    # Only L, D, B, M trigger delinquency when dayspastdue=-1.
+    # If dpd>0 use the numeric dpd bucket directly.
+    if pr == "S" and dpd == -1:
+        return 0
+    if pr == "S" and dpd > 0:
+        return (1 if dpd<=30 else 2 if dpd<=60 else 3 if dpd<=90 else
+                4 if dpd<=180 else 5 if dpd<=360 else 6 if dpd<=720 else 7)
+    if 61 <= dpd <= 90:
         return 3
-    # main6 → dpd=2
+    if pr == "M" and dpd == -1:
+        return 3
     if 31 <= dpd <= 60:
         return 2
-    # main7 → dpd=1
     if 1 <= dpd <= 30:
         return 1
-    # main8 → dpd=0: dpd==0 or pr=='S' and dpd==-1
     return 0
 
 
@@ -2090,25 +2087,12 @@ def build_global_attrs(account_details, fact2_enriched):
         )
     )
 
-    # Java sumBalAmtByRange (dqlBalFlag=false) uses ALL accounts (no isUns filter).
-    # For each (cust_id, idx): if not_closed AND dpd<=6 → add balance, else add 0.
-    # .average() over range includes ALL months in map (even 0-value ones).
-    # This matches our zero-fill _live_zf approach but for ALL idx 0..24.
-    _bal_zf_all = (
-        exploded
-        .filter(col("idx").between(0, 24))
-        .groupBy("cust_id", "idx")
-        .agg(
-            fsum(when(_live_qualify, col("bal")).otherwise(lit(0.0))).alias("sum_bal_all_zf"),
-        )
-    )
-
     live_bal_uns = (
         exploded
         .filter(
             (col("dpd") >= 0) & (col("dpd") <= 6) &
             col("is_not_closed") &
-            col("isUns")   # UnSec only — kept for other uses
+            col("isUns")   # UnSec only — for balance_amt_0_12_by_13_24
         )
         .groupBy("cust_id", "idx")
         .agg(
@@ -2128,20 +2112,15 @@ def build_global_attrs(account_details, fact2_enriched):
             favg(when((col("idx") >= 7) & (col("idx") <= 12), col("cnt_trades_zf"))).alias("_cnt_7_12"),
         )
         .join(
-            # Java sumBalAmtByRange: ALL accounts, 0-fill. avg(0..12) / avg(13..24).
-            # avg = sum/count where count = number of months in the map (all 13 or 12 months).
-            _bal_zf_all.filter(col("idx").between(0, 12)).groupBy("cust_id").agg(
-                favg("sum_bal_all_zf").alias("_bal_0_12_all"),
-            ).join(
-                _bal_zf_all.filter(col("idx").between(13, 24)).groupBy("cust_id").agg(
-                    favg("sum_bal_all_zf").alias("_bal_13_24_all"),
-                ), "cust_id", "left"
+            live_bal_uns.groupBy("cust_id").agg(
+                favg(when((col("idx") >= 0)  & (col("idx") <= 11), col("sum_bal_uns"))).alias("_bal_0_12_uns"),
+                favg(when((col("idx") >= 13) & (col("idx") <= 24), col("sum_bal_uns"))).alias("_bal_13_24_uns"),
             ),
             "cust_id", "left"
         )
         .withColumn("balance_amt_0_12_by_13_24",
-                    when(col("_bal_13_24_all") > 0,
-                         F.try_divide(col("_bal_0_12_all"), col("_bal_13_24_all"))).otherwise(lit(None)))
+                    when(col("_bal_13_24_uns") > 0,
+                         F.try_divide(col("_bal_0_12_uns"), col("_bal_13_24_uns"))).otherwise(lit(None)))
         .withColumn("live_cnt_6_12",
                     when(col("_cnt_7_12") > 0,
                          F.try_divide(col("_cnt_0_6"), col("_cnt_7_12"))).otherwise(lit(None)))
@@ -2156,7 +2135,7 @@ def build_global_attrs(account_details, fact2_enriched):
                     when(col("_bal_7_12") > 0,
                          F.try_divide(col("_bal_0_6"), col("_bal_7_12")))
                     .otherwise(lit(None)))
-        .drop("_bal_0_6","_bal_7_12","_cnt_0_6","_cnt_7_12","_bal_0_12_all","_bal_13_24_all")
+        .drop("_bal_0_6","_bal_7_12","_cnt_0_6","_cnt_7_12","_bal_0_12_uns","_bal_13_24_uns")
     )
 
     # Delinquent balance ratios
@@ -2216,126 +2195,75 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     # ── 4P. Frequency between account openings ────────────────────────────────
-    # Java L2503: accountOpenDate = acctOpenDtSet.first() = EARLIEST open date per account.
-    # Java L2546-2558: sort by (openDate ASC, typeCode_numeric ASC) for tie-breaking.
-    # Java L2567-2574: compute gap[i] = diff(entry[i-1].date, entry[i].date) for ALL accounts.
-    # Java L2578-2593: filter — include gap[i] only if entry[i].typeCode passes the filter.
-    # BUG: we were filtering accounts BEFORE computing gaps. Gap for entry[i] should be
-    # relative to entry[i-1] in the FULL sorted list, not just the filtered list.
+    # need to check with chargen
+    @udf(DoubleType())
+    def avg_gap_udf(arr):
+        # Java: computes average gap between ALL consecutive account open dates
+        # including same-month openings (gap=0). Sort order = ASC by open_dt.
+        if arr is None or len(arr) == 0:
+            return None
+        if len(arr) == 1:
+            return 0.0
+        # Include ALL consecutive pairs (even gap=0 for same-month openings)
+        gaps = [float(arr[i+1] - arr[i]) for i in range(len(arr)-1)]
+        return float(sum(gaps) / len(gaps)) if gaps else 0.0
+    
 
-    # Collect all accounts for freq_between using account_details (ad) which already has:
-    # - account_type_cd from most-recent month (post _recent_flags join) — matches Java getAccountTypeCode()
-    # - isUns, isCC from most-recent month flags — matches Java allUnSecProductCodes/allCCProductCodes
-    # - _open_abs = absolute months of open_dt (fmax, used for MOB)
-    # For freq_between, Java uses acctOpenDtSet.first() = EARLIEST open date.
-    # Compute earliest open_abs per account from fact2_enriched.
-    _min_open_abs = (
+    # freq_between_*: Java uses account OPEN DATE (accOpenDate), not MOB.
+    # open_dt is available in account_details as absolute month index.
+    # Use _open_abs (absolute months from epoch) for sorting and gap calculation.
+    # This gives exact calendar-month differences matching Java's getDifferenceInMonths.
+    mob_all_df = (
+        ad.groupBy("cust_id")
+        .agg(sort_array(collect_list(col("_open_abs"))).alias("_opens_all"))
+        .withColumn("freq_between_accts_all", avg_gap_udf(col("_opens_all")))
+        .drop("_opens_all")
+    )
+
+    # Fix: freq_between uses EARLIEST open_dt per account (Java L2503: acctOpenDtSet.first()).
+    # main open_dt uses fmax (for MOB). Compute separate earliest_open_abs here.
+    def yyyymmdd_to_abs(dt_col):
+        d = to_date(dt_col.cast("string"), "yyyyMMdd")
+        return year(d) * 12 + month(d)
+
+    _ad_earliest_open = (
         fact2_enriched
         .groupBy("cust_id", "cons_acct_key")
-        .agg(
-            (year(to_date(fmin("open_dt").cast("string"), "yyyyMMdd")) * 12 +
-             month(to_date(fmin("open_dt").cast("string"), "yyyyMMdd"))).alias("_min_open_abs")
-        )
-    )
+        .agg(yyyymmdd_to_abs(fmin("open_dt").cast("string")).alias("_earliest_open_abs"),
+             fmin("open_dt").alias("_min_open_dt"))
+    ).withColumnRenamed("cons_acct_key", "_acct_id2")
 
-    _freq_accounts = (
-        ad.join(
-            _min_open_abs.withColumnRenamed("cons_acct_key", "_acct_id"),
-            ["cust_id", "_acct_id"], "left"
-        )
-        .select(
+    # Join earliest open date into account_details for freq calculation
+    _ad_freq = ad.join(
+        _ad_earliest_open.select(
             "cust_id",
-            col("account_type_cd").alias("tc"),   # most-recent month type (matches Java)
-            col("_min_open_abs").alias("open_abs"), # earliest open date (matches Java acctOpenDtSet.first())
-            "isUns",  # most-recent month flag
-            "isCC",   # most-recent month flag
-        )
+            col("_acct_id2").alias("_acct_id"),
+            col("_earliest_open_abs").alias("_freq_open_abs")
+        ),
+        ["cust_id", "_acct_id"], "left"
     )
 
-    # Collect to pandas and compute freq_between with correct algorithm
-    _freq_rows = _freq_accounts.rdd.collect()
-    _freq_pdf = pd.DataFrame(_freq_rows, columns=["cust_id", "tc", "open_abs", "isUns", "isCC"])
-
-    # Java allUnSecProductCodes = Sec_Uns=="UnSec" in product_mapping = isUns flag
-    # Java allCreditCardProductCodes = CC codes = isCC flag
-    # Java excludeHL codes = {"058","195"} (padded 3 chars)
-    _FREQ_EXCL_HL = {"058", "195"}
-
-    def _compute_freq(cust_pdf):
-        # Sort by (open_abs ASC, typeCode_numeric ASC) — Java L2546-2558
-        try:
-            cust_pdf = cust_pdf.copy()
-            # Drop rows with null/NaN open_abs — Java skips invalid dates (isValidDate check L3110)
-            cust_pdf = cust_pdf.dropna(subset=["open_abs"])
-            if cust_pdf.empty:
-                return {"freq_between_accts_all": None,
-                        "freq_between_installment_trades": None,
-                        "freq_between_accts_unsec_wo_cc": None}
-            cust_pdf["open_abs"] = pd.to_numeric(cust_pdf["open_abs"], errors="coerce")
-            cust_pdf = cust_pdf.dropna(subset=["open_abs"])
-            cust_pdf["_tc_num"] = pd.to_numeric(cust_pdf["tc"], errors="coerce").fillna(999999)
-            cust_pdf = cust_pdf.sort_values(["open_abs", "_tc_num"]).reset_index(drop=True)
-        except Exception:
-            cust_pdf = cust_pdf.sort_values("open_abs").reset_index(drop=True)
-
-        opens = cust_pdf["open_abs"].tolist()
-        tcs   = cust_pdf["tc"].tolist()
-        isUns = cust_pdf["isUns"].tolist()
-        isCC  = cust_pdf["isCC"].tolist()
-        n = len(opens)
-
-        gaps_all, gaps_inst, gaps_uns = [], [], []
-        for i in range(1, n):
-            try:
-                gap = int(float(opens[i])) - int(float(opens[i-1]))
-            except (TypeError, ValueError):
-                continue  # skip rows with invalid open_abs
-            tc_padded = str(tcs[i]).zfill(3) if tcs[i] else ""
-
-            # freq_between_accts_all: include all
-            gaps_all.append(gap)
-
-            # freq_between_installment_trades: exclude {058,195}
-            if tc_padded not in _FREQ_EXCL_HL:
-                gaps_inst.append(gap)
-
-            # freq_between_accts_unsec_wo_cc: !CC AND isUns
-            if bool(isUns[i]) and not bool(isCC[i]):
-                gaps_uns.append(gap)
-
-        return {
-            "freq_between_accts_all":         sum(gaps_all)/len(gaps_all)   if gaps_all  else None,
-            "freq_between_installment_trades": sum(gaps_inst)/len(gaps_inst) if gaps_inst else None,
-            "freq_between_accts_unsec_wo_cc":  sum(gaps_uns)/len(gaps_uns)   if gaps_uns  else None,
-        }
-
-    _freq_results = []
-    for cust_id, grp in _freq_pdf.groupby("cust_id"):
-        res = _compute_freq(grp)
-        res["cust_id"] = int(cust_id)
-        _freq_results.append(res)
-
-    _freq_result_pdf = pd.DataFrame(_freq_results)
-    # Ensure column order matches _freq_schema exactly (cust_id first)
-    _freq_result_pdf = _freq_result_pdf[["cust_id", "freq_between_accts_all",
-                                          "freq_between_installment_trades",
-                                          "freq_between_accts_unsec_wo_cc"]]
-    _freq_result_pdf["cust_id"] = pd.to_numeric(_freq_result_pdf["cust_id"], errors="coerce").astype("int64")
-
-    _freq_schema = StructType([
-        StructField("cust_id",                        LongType(),   False),
-        StructField("freq_between_accts_all",          DoubleType(), True),
-        StructField("freq_between_installment_trades", DoubleType(), True),
-        StructField("freq_between_accts_unsec_wo_cc",  DoubleType(), True),
-    ])
-
-    freq_df = spark.createDataFrame(
-        spark.sparkContext.parallelize([tuple(r) for r in _freq_result_pdf.itertuples(index=False)]),
-        schema=_freq_schema
+    mob_uns_df = (
+        _ad_freq.filter(col("isUns") & ~col("isCC"))
+        .groupBy("cust_id")
+        .agg(sort_array(collect_list(col("_freq_open_abs"))).alias("_opens_uns"))
+        .withColumn("freq_between_accts_unsec_wo_cc", avg_gap_udf(col("_opens_uns")))
+        .drop("_opens_uns")
     )
 
-    # Remove old mob_all_df, mob_uns_df, mob_inst_df, _ad_freq — replaced above
+    mob_inst_df = (
+        _ad_freq.filter(~col("isCC") & ~col("isLapHl"))  # excl CC, HL(058), LAP(195) per Java L2588
+        .groupBy("cust_id")
+        .agg(sort_array(collect_list(col("_freq_open_abs"))).alias("_opens_inst"))
+        .withColumn("freq_between_installment_trades", avg_gap_udf(col("_opens_inst")))
+        .drop("_opens_inst")
+    )
 
+    freq_df = (
+        mob_all_df
+        .join(mob_uns_df,  "cust_id", "left")
+        .join(mob_inst_df, "cust_id", "left")
+    )
 
     # ── 4Q. Recency & DPD recency binning ────────────────────────────────────
     recency_df = (
