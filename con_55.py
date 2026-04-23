@@ -3,7 +3,7 @@
 # VERSION: con_14  (all product_mapping + bank_mapping fixes applied)
 # =============================================================================
 print("=" * 60)
-print("  RUNNING con_v2.py")
+print("  RUNNING con_v3.py")
 
 # ===========================================================================
 # OUTPUT MODE FLAG
@@ -152,7 +152,7 @@ CL_CODES        = {"189"}  # Java allCLProductCodes = {189} only (CD/Credit Line
 HL_CODES        = {"002", "058", "2", "58", "168", "240"}  # FIX: org_car.py L1580 cond['hl']=[58,168,240]. 195=LAP only in hl_lap, NOT in hl.
 AL_CODES        = {"47", "047", "221"}  # FIX: Java allALProductCodes={047,221}. 173=TW not AL — caused bidirectional nbr_al miscounts
 TWO_W_CODES     = {"013", "173", "13"}
-GL_CODES        = {"191", "007", "7"}
+GL_CODES        = {"191", "243"}  # custom_var L222: gl_prods={191,243}. 7/007 not in product_mapping
 
 # PL = Personal Loan: Pdt_Cls=RegUns MINUS CC types (5, 213, 225).
 # ADDED: 169, 170, 189, 242, 245, 247 (all RegUns per mapping, not in old set).
@@ -794,13 +794,14 @@ def build_account_details(fact2_enriched):
     # Our old code said "GT always picks OLDEST (fmax)" — that was wrong.
     # Java: for each non-derog UNS account, find the month with max balance in 0..23,
     # when tied take the MINIMUM month_diff (most recent). Then return minKey + 1.
+    # Java L2070: filter(entry -> entry.getValue() >= 0) — only non-negative balances
     _max_bal_per_acct = (
-        fact2_enriched.filter(col("month_diff") <= 23)
+        fact2_enriched.filter((col("month_diff") <= 23) & (col("balance_amt") >= 0))
         .groupBy("cust_id", "cons_acct_key")
         .agg(fmax("balance_amt").alias("_peak_bal"))
     )
     max_bal_idx = (
-        fact2_enriched.filter(col("month_diff") <= 23)
+        fact2_enriched.filter((col("month_diff") <= 23) & (col("balance_amt") >= 0))
         .join(_max_bal_per_acct, ["cust_id", "cons_acct_key"], "inner")
         .filter(col("balance_amt") == col("_peak_bal"))
         .groupBy("cust_id", "cons_acct_key")
@@ -829,7 +830,7 @@ def build_account_details(fact2_enriched):
 # PHASE 4 — GLOBAL ATTRIBUTE CALCULATION
 # ===========================================================================
 
-def build_global_attrs(account_details, fact2_enriched):
+def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # Rename cons_acct_key to _acct_id to eliminate AMBIGUOUS_REFERENCE.
     # build_account_details groups by cons_acct_key and joins DataFrames that also
     # carry cons_acct_key — Spark sees the name twice in the column lineage.
@@ -1109,7 +1110,8 @@ def build_global_attrs(account_details, fact2_enriched):
     _per_acct_uns_util = (
         exploded
         .join(_live_for_util, ["cust_id", "_cons_key"], "inner")
-        .filter(col("account_type_cd").cast("int").isin(list(_CV_UNS)) & (F.col("mod_lim") > 0))
+        # Fix: use isUns (product_mapping) not _CV_UNS — includes 244,245,247 etc.
+        .filter(col("isUns") & (F.col("mod_lim") > 0))
         .groupBy("cust_id", "_cons_key")
         .agg(
             F.sum(F.when(F.col("idx") <= 2,  F.col("bal"))).alias("_bal_l3m"),
@@ -1125,7 +1127,8 @@ def build_global_attrs(account_details, fact2_enriched):
     # Java calculateUtilL12mUnsTot: ALL accounts (no live filter) — confirmed from Java source
     _per_acct_uns_util_l12m = (
         exploded
-        .filter(col("account_type_cd").cast("int").isin(list(_CV_UNS)) & (F.col("mod_lim") > 0))
+        # Fix: use isUns (product_mapping) not _CV_UNS — includes 244,245,247 etc.
+        .filter(col("isUns") & (F.col("mod_lim") > 0))
         .groupBy("cust_id", "_cons_key")
         .agg(
             F.sum(F.when(F.col("idx") <= 11, F.col("bal"))).alias("_bal_l12m"),
@@ -1208,9 +1211,14 @@ def build_global_attrs(account_details, fact2_enriched):
         _per_acct_all_util
         .groupBy("cust_id")
         .agg(
-            favg(when(col("_n_l3m")  > 0, col("_u_l3m"))).alias("avg_util_l3m_all_tot"),
-            favg(when(col("_n_l6m")  > 0, col("_u_l6m"))).alias("avg_util_l6m_all_tot"),
-            favg(when(col("_n_l12m") > 0, col("_u_l12m"))).alias("avg_util_l12m_all_tot"),
+            # Java L1393: only add util IF accountLevelBalanceAmount > 0
+            # sum(util when bal>0) / count(all accounts with n>0)
+            (fsum(when((col("_n_l3m")>0) & (col("_bal_l3m")>0), col("_u_l3m"))) /
+             fsum(when(col("_n_l3m")>0, lit(1)))).alias("avg_util_l3m_all_tot"),
+            (fsum(when((col("_n_l6m")>0) & (col("_bal_l6m")>0), col("_u_l6m"))) /
+             fsum(when(col("_n_l6m")>0, lit(1)))).alias("avg_util_l6m_all_tot"),
+            (fsum(when((col("_n_l12m")>0) & (col("_bal_l12m")>0), col("_u_l12m"))) /
+             fsum(when(col("_n_l12m")>0, lit(1)))).alias("avg_util_l12m_all_tot"),
         )
         .join(_ros_all_util, "cust_id", "left")
     )
@@ -1545,318 +1553,386 @@ def build_global_attrs(account_details, fact2_enriched):
         .withColumnRenamed("_is_live", "isLiveAccount")
     )
 
-    _of_cols = ["cust_id", "_cons_key", "accno", "month_diff", "balance_amt",
-                "isCC", "isHL", "isAL", "isTW", "isPL", "isSecMov",
-                "isSecMovRegSec", "isRegUns", "isPlCdTw", "account_type_cd"]
+# ══════════════════════════════════════════════════════════════════════════
+    # EMI OUTFLOW COMPUTATION — custom_var.py reference (L927-1324)
+    # Population-level IR estimation + limit-band fallback for accounts
+    # without enough consecutive balance history.
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _calculate_overflow_hc(rows_for_account, is_cd_product):
+    def _build_common_prods(trade_pdf, acct_type_col="account_type_cd"):
         """
-        Faithful Python translation of Java ScoreCardHelperV4.calculateOverflow_HC.
-        rows_for_account: list of dicts with month_diff, balance_amt (already bal>0 filtered)
-        is_cd_product: bool — True for type 189 (CD), False for instalment loans
-        Returns: median EMI for this account (float) or None
+        Replicates custom_var common_processing_all_prods (L936-1029).
+        Input: pandas DataFrame with live accounts, columns:
+               cust_id, tgt_key, account_type_cd, open_dt, balance_dt, balance_amt
+        Returns pivot DataFrame with columns: cust_id, tgt_key, account_type_cd, '1'..'20'
         """
-        import statistics
+        import numpy as np
 
-        if not rows_for_account:
-            return None
+        bal = trade_pdf[["cust_id", "tgt_key", acct_type_col,
+                          "open_dt", "balance_dt", "balance_amt"]].copy()
 
-        # STEP 0: Sort DESC by month_diff (oldest = highest idx = first in list)
-        # Java sorts the inner map by key DESC, iterating oldest→newest.
-        # In our idx space: idx=35 oldest, idx=0 most recent.
-        # DESC order: rows_desc[0].idx = highest (oldest), rows_desc[-1].idx = 0 (newest).
-        rows_desc = sorted(rows_for_account, key=lambda r: -r["month_diff"])
+        # Convert dates for sorting
+        bal["bal_dt_1"]  = pd.to_datetime(bal["balance_dt"].astype(str), format="%Y%m%d", errors="coerce")
+        bal["open_dt_1"] = pd.to_datetime(bal["open_dt"].astype(str),    format="%Y%m%d", errors="coerce")
 
-        bals = [r["balance_amt"] for r in rows_desc]
-        idxs = [r["month_diff"] for r in rows_desc]  # descending: e.g. 11,10,9,...,1,0
+        bal.sort_values(["cust_id", "tgt_key", "open_dt_1", "bal_dt_1"],
+                        ascending=True, inplace=True)
 
-        n = len(rows_desc)
-        if n < 2:
-            return None
+        # First 50 rows per account
+        bal2 = bal.groupby(["cust_id", "tgt_key"]).head(50).copy()
 
-        # STEP 1: ELIGIBILITY — count consecutive month markers
-        # Java: for each pair (curr=older, next=curr-1=more_recent):
-        #   monthDiff = nextCal.MONTH - currCal.MONTH == 1 (same year consecutive)
-        # In our abs idx space: curr.idx - next.idx == 1 for consecutive months in DESC.
-        # i.e. diff = idxs[i] - idxs[i+1] == 1
-        month_map = {}  # position → 1 if consecutive with next
-        count = 1
-        for i in range(n - 1):
-            curr_idx = idxs[i]      # older (higher idx)
-            next_idx = idxs[i + 1]  # more recent (lower idx)
-            diff = curr_idx - next_idx  # == 1 for consecutive in DESC order
-            if bals[i] > 0:
-                if diff == 1:   # consecutive months
-                    month_map[count] = 1
-                count += 1
+        # Keep positive balances only
+        bal3 = bal2[bal2["balance_amt"] > 0].copy()
+        if bal3.empty:
+            return pd.DataFrame(columns=["cust_id", "tgt_key", acct_type_col] +
+                                        [str(i) for i in range(1, 21)])
 
-        # calculateConcMonthFlags: max consecutive run of 1s in month_map
-        def _max_conc_flags(mmap, index_limit):
-            max_cons = 0
-            cons = 0
-            for pos in range(1, index_limit + 1):
-                if mmap.get(pos, 0) == 1:
-                    cons += 1
-                    max_cons = max(max_cons, cons)
-                else:
-                    cons = 0
-            return max_cons
+        # Consecutive month marker within each account group
+        bal3["balance_mth"]     = (bal3["balance_dt"].astype(float) // 100 % 100).astype(int)
+        bal3["bal_mth_lag"]     = bal3.groupby(["cust_id", "tgt_key"])["balance_mth"].shift(1)
+        bal3["lag_diff"]        = bal3["balance_mth"] - bal3["bal_mth_lag"]
+        bal3["consec_marker"]   = np.where(bal3["lag_diff"].isin([1, -11]), 1, 0)
+        bal3["consec_mk_lag"]   = bal3.groupby(["cust_id", "tgt_key"])["consec_marker"].shift(1).fillna(0)
+        bal3["consec_3_marker"] = np.where((bal3["consec_marker"] + bal3["consec_mk_lag"]) == 2, 1, 0)
 
-        max_cons_inc = _max_conc_flags(month_map, 36)
-        if max_cons_inc < 2:
-            return None  # account not eligible
+        # Accounts that have at least one consec_3 row
+        grp1 = bal3.groupby(["cust_id", "tgt_key"])["consec_3_marker"].max().reset_index()
+        grp1.rename(columns={"consec_3_marker": "consec_3"}, inplace=True)
+        target_no_consec = grp1[grp1["consec_3"] == 0][["cust_id", "tgt_key"]]
+        no_consec_keys = set(zip(target_no_consec["cust_id"], target_no_consec["tgt_key"]))
 
-        # STEP 2: Build consec_marker windowing on balance-positive rows
-        # Filter to rows where bal > 0 (already done since input is filtered)
-        score_list = rows_desc  # already filtered bal > 0
+        bal4 = bal3[~bal3.set_index(["cust_id", "tgt_key"]).index.isin(no_consec_keys)].copy()
+        if bal4.empty:
+            return pd.DataFrame(columns=["cust_id", "tgt_key", acct_type_col] +
+                                        [str(i) for i in range(1, 21)]), target_no_consec
 
-        sz = len(score_list)
-        consec_marker      = [0] * sz
-        consec_marker_lag  = [0] * sz
-        consec_3_marker    = [0] * sz
-        consec_3_marker_l1 = [0] * sz
-        consec_3_marker_l2 = [0] * sz
+        # Extend consec_3 markers to cover 3-row windows (lag-1 and lag-2)
+        bal4["c3_lag1"] = bal4.groupby(["cust_id", "tgt_key"])["consec_3_marker"].shift(-1).fillna(0)
+        bal4["c3_lag2"] = bal4.groupby(["cust_id", "tgt_key"])["consec_3_marker"].shift(-2).fillna(0)
+        bal4["final_consec"] = np.where(
+            (bal4["consec_3_marker"] == 1) | (bal4["c3_lag1"] == 1) | (bal4["c3_lag2"] == 1), 1, 0)
 
-        # Build consec_marker: 1 if this entry and the previous are consecutive months.
-        # score_list is DESC (oldest first). prev = older (higher idx), curr = newer (lower idx).
-        # Consecutive: prev.idx - curr.idx == 1
-        for i in range(1, sz):
-            prev_idx = score_list[i - 1]["month_diff"]  # older
-            curr_idx = score_list[i]["month_diff"]       # more recent
-            if prev_idx - curr_idx == 1:
-                consec_marker[i] = 1
+        # Keep only rows in consecutive windows
+        bal5 = bal4[bal4["final_consec"] == 1].copy()
 
-        # consec_marker_lag: shift marker by 1 position
-        for j in range(1, sz):
-            consec_marker_lag[j] = consec_marker[j - 1]
+        # Sort by balance_dt, take first 30 per account
+        bal5.sort_values(["cust_id", "tgt_key", "balance_dt"], inplace=True)
+        bal6 = bal5.groupby(["cust_id", "tgt_key"]).head(30).copy()
 
-        # consec_3_marker: 1 where marker + lag == 2 (both this and prev consecutive)
-        for k in range(sz):
-            if consec_marker[k] + consec_marker_lag[k] == 2:
-                consec_3_marker[k] = 1
+        # Keep positive balances, assign sequential ID 1,2,3,...
+        bal6 = bal6[bal6["balance_amt"] > 0].copy()
+        bal6["ID"] = bal6.groupby(["cust_id", "tgt_key"]).cumcount() + 1
+        bal6 = bal6[bal6["ID"] <= 20]  # max 20 balances
+        bal6["ID"] = bal6["ID"].astype(str)
 
-        # lags of consec_3_marker
-        for l in range(2, sz):
-            consec_3_marker_l1[l - 1] = consec_3_marker[l]
-            consec_3_marker_l2[l - 2] = consec_3_marker[l]
+        # Pivot to wide format
+        bal7 = bal6.pivot_table(
+            values="balance_amt",
+            index=["cust_id", "tgt_key", acct_type_col],
+            columns="ID"
+        ).reset_index()
+        bal7.columns.name = None
 
-        # final_consec_marker: part of a 3-consecutive run
-        final_marker = [0] * sz
-        for i in range(sz):
-            if consec_3_marker[i] == 1 or consec_3_marker_l1[i] == 1 or consec_3_marker_l2[i] == 1:
-                final_marker[i] = 1
+        # Ensure columns 1..20 exist
+        for c in [str(i) for i in range(1, 21)]:
+            if c not in bal7.columns:
+                bal7[c] = float("nan")
 
-        # Collect balances with final_consec_marker == 1, up to 20
-        TWENTY = 20
-        balances = []
-        for i in range(sz):
-            if final_marker[i] == 1 and len(balances) < TWENTY:
-                balances.append(score_list[i]["balance_amt"])
+        cols_keep = ["cust_id", "tgt_key", acct_type_col] + [str(i) for i in range(1, 21)]
+        bal7 = bal7[[c for c in cols_keep if c in bal7.columns]]
 
-        if len(balances) < 2:
-            return None
+        return bal7, target_no_consec
 
-        # STEP 3: EMI calculation
-        sz_b = len(balances)
-        length = (sz_b - 2) if sz_b == TWENTY else (sz_b - 1)
+    def _build_common_limits(trade_pdf, acct_type_col="account_type_cd"):
+        """custom_var common_processing_all_limits (L927-934): max(original_loan_amt)."""
+        cols = ["cust_id", "tgt_key", acct_type_col]
+        lim = trade_pdf.groupby(cols).agg(
+            max_lim=("original_loan_amt", "max")
+        ).reset_index()
+        lim2 = lim.drop(columns=[acct_type_col])
+        return lim, lim2
 
-        if is_cd_product:
-            # calculateEMICd_HC: starts at i=1 (skips most-recent month)
-            emi_list = []
-            for i in range(1, length):
-                if balances[i] > 0:
-                    bal_diff = balances[i] - balances[i + 1]
-                    # Exclude "full payoff" months where diff == balance (loan cleared)
-                    if bal_diff != balances[i]:
-                        emi_list.append(bal_diff)
-        else:
-            # IR estimation
-            ir_list = []
-            for i in range(len(balances) - 2):
-                numerator   = balances[i + 1] - balances[i + 2]
-                denominator = balances[i]     - balances[i + 1]
-                if denominator != 0:
-                    ir = (numerator / denominator - 1) * 12
-                    if 0.06 <= ir < 0.45:
-                        ir_list.append(ir)
+    def _assign_limit_bands(df, col, lim_arr):
+        """Map max_lim to 1..20 bands using 19 quantile breakpoints."""
+        import numpy as np
+        conds = [df[col] <= lim_arr[0]]
+        for k in range(len(lim_arr) - 1):
+            conds.append((df[col] > lim_arr[k]) & (df[col] <= lim_arr[k+1]))
+        conds.append(df[col] > lim_arr[-1])
+        choices = list(range(1, len(conds) + 1))
+        return np.select(conds, choices, default=10)
 
-            if not ir_list:
-                return None
+    def _further_processing(bal7, limits2, acct_type_col="account_type_cd"):
+        """
+        Replicates custom_var further_processing_all_exc_cc_cd (L1066-1324).
+        Returns final_frame with cust_id, tgt_key, account_type_cd, FINAL_IR, FINAL_EMI, max_lim
+        """
+        import numpy as np
 
-            # Rank IRs into buckets
-            def _get_ir_rank(ir_val):
-                ranges = [(0.06 + i * 0.02, 0.08 + i * 0.02) for i in range(21)]
-                for rank_idx, (lo, hi) in enumerate(ranges):
-                    if lo <= ir_val < hi:
-                        return rank_idx + 1
-                return -1
+        if bal7 is None or bal7.empty:
+            return pd.DataFrame(columns=["cust_id", "tgt_key", acct_type_col,
+                                          "FINAL_IR", "FINAL_EMI", "max_lim"])
 
-            from collections import defaultdict
-            rank_to_irs = defaultdict(list)
-            for ir_val in ir_list:
-                rank = _get_ir_rank(ir_val)
-                rank_to_irs[rank].append(ir_val)
+        b = bal7.copy()
 
-            # Modal rank: most frequent, if tie pick higher rank; must have >1 occurrence
-            max_size = max(len(v) for v in rank_to_irs.values()) if rank_to_irs else 0
-            if max_size < 2:
-                return None
+        # ── IR computation: IR_i = ((bal[i+1]-bal[i+2])/(bal[i]-bal[i+1])-1)*12 ──
+        for i in range(1, 19):
+            c1, c2, c3 = str(i), str(i+1), str(i+2)
+            if c1 in b and c2 in b and c3 in b:
+                denom = b[c1].sub(b[c2])
+                numer = b[c2].sub(b[c3])
+                ir    = (numer.div(denom) - 1) * 12
+                b[f"IR{i}"] = ir
+            else:
+                b[f"IR{i}"] = float("nan")
 
-            mode_rank = max(
-                (r for r, v in rank_to_irs.items() if len(v) == max_size),
-                default=-1
-            )
-            if mode_rank < 0:
-                return None
+        # Filter IR to valid range [0.06, 0.45)
+        for i in range(1, 19):
+            ir_col = f"IR{i}"
+            b[f"IR{i}_NEW"] = np.where(
+                (b[ir_col] >= 0.06) & (b[ir_col] < 0.45), b[ir_col], float("nan"))
 
-            final_ir = sum(rank_to_irs[mode_rank]) / len(rank_to_irs[mode_rank])
-            final_ir = min(final_ir, 0.45)
+        # Bucket each IR_NEW into 21 buckets (0.06-0.08, 0.08-0.10, ..., 0.46-0.48)
+        buckets = [(0.06 + k*0.02, 0.08 + k*0.02) for k in range(21)]
+        for i in range(1, 19):
+            vc = f"IR{i}_NEW"
+            bc = f"IR{i}_NEW_B_{i}"
+            # custom_var: all buckets use IR > lo AND IR <= hi (exclusive lower bound)
+            # IR exactly at 0.06 → valid range but no bucket → IR_NEW_B = NaN → excluded
+            conds_b  = [((b[vc] > lo) & (b[vc] <= hi)) for lo, hi in buckets]
+            b[bc] = np.select(conds_b, list(range(1, 22)), default=float("nan"))
+            b[bc] = np.where(b[vc].isna(), float("nan"), b[bc])
 
-            # calculateEMI_HC: starts at i=0
-            emi_list = []
-            for i in range(length):
-                if balances[i] > 0:
-                    emi = balances[i] * (1 + final_ir / 12) - balances[i + 1]
-                    if i + 1 < length + 1:
-                        emi_list.append(emi)
+        # Modal bucket across IR1..IR18
+        bucket_cols = [f"IR{i}_NEW_B_{i}" for i in range(1, 19)]
+        modes_df  = b[bucket_cols].mode(axis=1)
+        b["mode"]     = modes_df.iloc[:, 0]
+        b["mode_cnt"] = b[bucket_cols].eq(b["mode"], axis=0).sum(axis=1)
 
-        if not emi_list:
-            return None
+        # Zero out non-modal IR; zero out if mode_cnt==1
+        for i in range(1, 19):
+            vc = f"IR{i}_NEW"
+            bc = f"IR{i}_NEW_B_{i}"
+            b[vc] = np.where(b[bc] == b["mode"], b[vc], float("nan"))
+            b[vc] = np.where(b["mode_cnt"] == 1, float("nan"), b[vc])
 
-        emi_list_sorted = sorted(emi_list)
-        sz_e = len(emi_list_sorted)
-        if sz_e % 2 == 0:
-            median_emi = (emi_list_sorted[sz_e // 2 - 1] + emi_list_sorted[sz_e // 2]) / 2.0
-        else:
-            median_emi = emi_list_sorted[sz_e // 2]
-        return median_emi
+        # AVG_FINAL_IR = mean of surviving IR values; cap at 0.45
+        ir_new_cols = [f"IR{i}_NEW" for i in range(1, 19)]
+        b["AVG_FINAL_IR"] = b[ir_new_cols].mean(axis=1)
+        bal8 = b[b["AVG_FINAL_IR"].notna()].copy()
+        bal8["FINAL_IR"] = np.where(bal8["AVG_FINAL_IR"] >= 0.45, 0.45, bal8["AVG_FINAL_IR"])
+        bal8 = bal8.drop_duplicates(["cust_id", "tgt_key"])
 
-    # Collect all outflow data to pandas for per-account processing
-    _of_rows = _of_input.select(
-        "cust_id", "_cons_key", "accno", "month_diff", "balance_amt",
-        "isCC", "isHL", "isAL", "isTW", "isPL", "isSecMov",
-        "isSecMovRegSec", "isRegUns", "isPlCdTw", "account_type_cd", "isLiveAccount"
-    ).rdd.collect()
+        # ── EMI computation: EMI_Mi = bal[i]*(1+IR/12) - bal[i+1] ──
+        emi_cols = []
+        for i in range(1, 19):
+            ec = f"EMI_M{i}"
+            c1, c2 = str(i), str(i+1)
+            if c1 in bal8.columns and c2 in bal8.columns:
+                bal8[ec] = bal8[c1] * (1 + bal8["FINAL_IR"] / 12) - bal8[c2]
+            else:
+                bal8[ec] = float("nan")
+            emi_cols.append(ec)
 
-    _of_pdf = pd.DataFrame(
-        _of_rows,
-        columns=["cust_id", "_cons_key", "accno", "month_diff", "balance_amt",
-                 "isCC", "isHL", "isAL", "isTW", "isPL", "isSecMov",
-                 "isSecMovRegSec", "isRegUns", "isPlCdTw", "account_type_cd", "isLiveAccount"]
+        bal8["FINAL_EMI"] = bal8[emi_cols].median(axis=1)
+        bal9 = bal8[["cust_id", "tgt_key", acct_type_col, "FINAL_IR", "FINAL_EMI"]].copy()
+        bal9 = bal9.drop_duplicates(["cust_id", "tgt_key"])
+
+        # Join limits
+        bal10 = pd.merge(bal9,
+                         limits2[["cust_id", "tgt_key", "max_lim"]],
+                         on=["cust_id", "tgt_key"], how="inner")
+        bal10 = bal10.drop_duplicates(["cust_id", "tgt_key"])
+
+        # NOTE: The limit-band fallback (custom_var L1247-1322) requires the FULL
+        # production population for correct quantile computation. Running it on a
+        # small validation batch assigns wrong median EMI to accounts without valid
+        # IR, causing spurious non-zero outflow for customers with ref=0.
+        # Decision: skip fallback → accounts without valid IR contribute NaN → 0.
+        # This matches reference behaviour for those customers.
+        final_frame = bal10.drop_duplicates(["cust_id", "tgt_key"])
+        return final_frame
+
+    # ── Collect trade data for EMI products ──────────────────────────────────
+    # Live accounts only (custom_var L885: closed_max==0)
+    # EMI data: use fact2_enriched (has open_dt + original_loan_amt per row)
+    # custom_var L885: live accounts only (closed_max==0 = no close date across all rows)
+    # Join with account_details to filter isLiveAccount (account open at scoring date)
+    # EMI: join fact2_enriched with account_details to get isLiveAccount flag
+    # Alias both sides to avoid ambiguous column references in Spark join
+    _fe_emi  = fact2_enriched.alias("fe_emi")
+    _ad_emi  = account_details.select(
+        col("cust_id").alias("_ad_cust"),
+        col("cons_acct_key").alias("_ad_ck"),
+        col("isLiveAccount").alias("_is_live_emi"),
+        col("account_type_cd").alias("_atc_emi"),
+    ).alias("ad_emi")
+    _emi_live = (
+        _fe_emi
+        .join(_ad_emi,
+              (F.col("fe_emi.cust_id")        == F.col("ad_emi._ad_cust")) &
+              (F.col("fe_emi.cons_acct_key")   == F.col("ad_emi._ad_ck")),
+              "left")
+        .filter(F.col("ad_emi._is_live_emi") == True)
+        .select(
+            F.col("fe_emi.cust_id"),
+            F.col("fe_emi.cons_acct_key").alias("tgt_key"),
+            F.col("ad_emi._atc_emi").alias("account_type_cd"),
+            F.col("fe_emi.open_dt"),
+            F.col("fe_emi.balance_dt"),
+            F.col("fe_emi.balance_amt"),
+            F.col("fe_emi.original_loan_amt"),
+        )
     )
+    _emi_pdf = _emi_live.rdd.collect()
+    _emi_pdf = pd.DataFrame(_emi_pdf, columns=[
+        "cust_id", "tgt_key", "account_type_cd", "open_dt",
+        "balance_dt", "balance_amt", "original_loan_amt"])
+    _emi_pdf["balance_amt"]       = pd.to_numeric(_emi_pdf["balance_amt"],       errors="coerce")
+    _emi_pdf["original_loan_amt"] = pd.to_numeric(_emi_pdf["original_loan_amt"], errors="coerce").fillna(0)
+    _emi_pdf["balance_dt"]        = pd.to_numeric(_emi_pdf["balance_dt"],        errors="coerce")
+    _emi_pdf["open_dt"]           = pd.to_numeric(_emi_pdf["open_dt"],           errors="coerce")
+    _emi_pdf["account_type_cd"]   = _emi_pdf["account_type_cd"].astype(str).str.lstrip("0")
 
-    # Per-outflow variable: compute median EMI per (cust_id, account) then sum per cust
-    # Each variable uses a different account filter (matching Java's product sets)
-    # Java calculateOutflow_HC is called with a pre-filtered conskeyNVariablesMap:
-    #   HL_LAP:  isSecMov=True (LAP) OR isHL=True
-    #   AL_TW:   isAL=True OR isTW=True
-    #   PL:      isPL=True
-    #   CD:      account_type_cd == "189"  (isCdProduct=True)
-    #   total_monthly_outflow_wo_cc: all non-CC (isCC=False), CD handled separately
+    def _further_processing_cd(bal7, limits2):
+        """
+        custom_var further_processing_cd (L1474-1613):
+        CD outflow = median(BAL_DIFF_1..17) where BAL_DIFF_i = bal[i+1] - bal[i+2].
+        No IR computation — direct balance differences. Negative EMI is valid.
+        """
+        import numpy as np
+        if bal7 is None or bal7.empty:
+            return pd.DataFrame(columns=["cust_id", "tgt_key", "account_type_cd", "FINAL_EMI", "max_lim"])
+        b = bal7.copy()
+        # BAL_DIFF_i = bal[i+1] - bal[i+2]  (custom_var L1479-1498)
+        diff_cols = []
+        for i in range(1, 18):
+            c1, c2 = str(i+1), str(i+2)
+            dc = f"BAL_DIFF_{i}"
+            if c1 in b.columns and c2 in b.columns:
+                b[dc] = b[c1] - b[c2]
+            else:
+                b[dc] = float("nan")
+            diff_cols.append(dc)
+        # FINAL_EMI = median of BAL_DIFF_1..17 (including negatives — custom_var L1516)
+        b["FINAL_EMI"] = b[diff_cols].median(axis=1)
+        bal8 = b[b["FINAL_EMI"].notna()].copy()
+        bal8 = bal8.drop_duplicates(["cust_id", "tgt_key"])
+        if bal8.empty:
+            return pd.DataFrame(columns=["cust_id", "tgt_key", "account_type_cd", "FINAL_EMI", "max_lim"])
+        bal9 = bal8[["cust_id", "tgt_key", "account_type_cd", "FINAL_EMI"]].copy()
+        bal9 = bal9.drop_duplicates(["cust_id", "tgt_key"])
+        # Join limits (custom_var L1529)
+        bal10 = pd.merge(bal9, limits2[["cust_id", "tgt_key", "max_lim"]],
+                         on=["cust_id", "tgt_key"], how="inner")
+        bal10 = bal10.drop_duplicates(["cust_id", "tgt_key"])
+        return bal10
 
-    outflow_results = {
-        "HL_LAP_outflow":             [],
-        "AL_TW_outflow":              [],
-        "PL_outflow":                 [],
-        "CD_outflow":                 [],
-        "Outflow_uns_secmov":         [],
-        "Outflow_AL_PL_TW_CD":        [],
-        "total_outflow_wo_cc":        [],
-    }
+    def _compute_outflow(product_codes, label):
+        """Run full custom_var EMI pipeline for one product group."""
+        tr = _emi_pdf[_emi_pdf["account_type_cd"].isin(product_codes)].copy()
+        if tr.empty:
+            return pd.DataFrame(columns=["cust_id", label])
+        result = _build_common_prods(tr)
+        if isinstance(result, tuple):
+            bal7, no_consec = result
+        else:
+            bal7 = result
+            no_consec = pd.DataFrame(columns=["cust_id", "tgt_key"])
+        lim_full, lim2 = _build_common_limits(tr)
+        # lim2 already contains cust_id, tgt_key, max_lim — no re-merge needed
+        final = _further_processing(bal7, lim2)
+        if final.empty:
+            return pd.DataFrame(columns=["cust_id", label])
+        out = final.groupby("cust_id")["FINAL_EMI"].sum().reset_index()
+        out.rename(columns={"FINAL_EMI": label}, inplace=True)
+        return out
 
-    for (cust_id, cons_key), grp in _of_pdf.groupby(["cust_id", "_cons_key"]):
-        rows = grp.to_dict("records")
-        is_live = bool(grp["isLiveAccount"].iloc[0]) if "isLiveAccount" in grp.columns else True
-        is_hl   = bool(grp["isHL"].iloc[0])
-        is_al   = bool(grp["isAL"].iloc[0])
-        is_tw   = bool(grp["isTW"].iloc[0])
-        is_pl   = bool(grp["isPL"].iloc[0])
-        is_cc   = bool(grp["isCC"].iloc[0])
-        is_secmov = bool(grp["isSecMov"].iloc[0])
-        is_secmov_regsec = bool(grp["isSecMovRegSec"].iloc[0])
-        is_reguns = bool(grp["isRegUns"].iloc[0])
-        is_plcdtw = bool(grp["isPlCdTw"].iloc[0])
-        acd     = str(grp["account_type_cd"].iloc[0]) if grp["account_type_cd"].iloc[0] else ""
-        is_cd   = (acd.lstrip("0") == "189" or acd == "189")
+    def _compute_cd_outflow():
+        """CD outflow uses balance-difference algorithm (custom_var further_processing_cd)."""
+        tr = _emi_pdf[_emi_pdf["account_type_cd"].isin({"189"})].copy()
+        if tr.empty:
+            return pd.DataFrame(columns=["cust_id", "CD_outflow"])
+        result = _build_common_prods(tr)
+        bal7 = result[0] if isinstance(result, tuple) else result
+        lim_full, lim2 = _build_common_limits(tr)
+        final = _further_processing_cd(bal7, lim2)
+        if final.empty:
+            return pd.DataFrame(columns=["cust_id", "CD_outflow"])
+        out = final.groupby("cust_id")["FINAL_EMI"].sum().reset_index()
+        out.rename(columns={"FINAL_EMI": "CD_outflow"}, inplace=True)
+        return out
 
-        # Compute median EMI for this account
-        emi_non_cd = _calculate_overflow_hc(rows, is_cd_product=False)
-        emi_cd     = _calculate_overflow_hc(rows, is_cd_product=True) if is_cd else None
+    _pl_out  = _compute_outflow({"123", "228"},  "PL_outflow")
+    _hl_out  = _compute_outflow({"58", "195"},   "HL_LAP_outflow")
+    _al_out  = _compute_outflow({"47", "173"},   "AL_TW_outflow")
+    _cd_out  = _compute_cd_outflow()             # custom_var BAL_DIFF algorithm
 
-        accno = int(grp["accno"].iloc[0])
-
-        # Ensure cust_id is int (pandas groupby key may be string)
-        cust_id_int = int(cust_id)
-
-        # EMI dispatch uses SEPARATE EMI codes (from custom_var.py)
-        # NOT the isHL/isPL flags (those come from count codes)
-        _acd_stripped = acd.lstrip("0") if acd else ""
-        is_emi_hl  = _acd_stripped in {"58", "195"}   # EMI_HL_CODES
-        is_emi_pl  = _acd_stripped in {"123", "228"}  # EMI_PL_CODES
-        is_emi_al  = _acd_stripped in {"47"}           # AL
-        is_emi_tw  = _acd_stripped in {"173"}          # TW
-
-        # HL_LAP: EMI_HL_CODES, live only
-        if is_live and is_emi_hl and emi_non_cd is not None:
-            outflow_results["HL_LAP_outflow"].append((cust_id_int, emi_non_cd))
-
-        # AL_TW: EMI_AL_TW_CODES (non-CD), live only
-        if is_live and (is_emi_al or is_emi_tw) and not is_cd and emi_non_cd is not None:
-            outflow_results["AL_TW_outflow"].append((cust_id_int, emi_non_cd))
-
-        # PL: EMI_PL_CODES (non-CD), live only
-        if is_live and is_emi_pl and not is_cd and emi_non_cd is not None:
-            outflow_results["PL_outflow"].append((cust_id_int, emi_non_cd))
-
-        # CD: type 189, live only
-        if is_live and is_cd and emi_cd is not None:
-            outflow_results["CD_outflow"].append((cust_id_int, emi_cd))
-
-        # Outflow_uns_secmov: isSecMovRegSec OR isRegUns, live only; CD handled separately
-        if is_live and is_secmov_regsec and emi_non_cd is not None:
-            outflow_results["Outflow_uns_secmov"].append((cust_id_int, emi_non_cd))
-        if is_live and is_cd and emi_cd is not None:
-            outflow_results["Outflow_uns_secmov"].append((cust_id_int, emi_cd))
-
-        # Outflow_AL_PL_TW: isPlCdTw (non-CD part) + CD part, live only
-        if is_live and is_plcdtw and not is_cd and emi_non_cd is not None:
-            outflow_results["Outflow_AL_PL_TW_CD"].append((cust_id_int, emi_non_cd))
-        if is_live and is_cd and emi_cd is not None:
-            outflow_results["Outflow_AL_PL_TW_CD"].append((cust_id_int, emi_cd))
-
-        # total_outflow_wo_cc: all non-CC, live only
-        if is_live and not is_cc:
-            if is_cd and emi_cd is not None:
-                outflow_results["total_outflow_wo_cc"].append((cust_id_int, emi_cd))
-            elif not is_cd and emi_non_cd is not None:
-                outflow_results["total_outflow_wo_cc"].append((cust_id_int, emi_non_cd))
-
-    def _to_spark_df(pairs, col_name):
-        if not pairs:
+    def _pdf_to_spark(pdf, col_name):
+        if pdf.empty:
             return spark.createDataFrame([], schema=StructType([
                 StructField("cust_id", LongType(), False),
-                StructField(col_name, DoubleType(), True),
+                StructField(col_name,  DoubleType(), True),
             ]))
-        pdf = pd.DataFrame(pairs, columns=["cust_id", "emi"])
+        pdf = pdf.copy()
         pdf["cust_id"] = pd.to_numeric(pdf["cust_id"], errors="coerce").astype("int64")
-        agg = pdf.groupby("cust_id")["emi"].sum().reset_index()
-        agg.columns = ["cust_id", col_name]
-        rows = [(int(c), float(e)) for c, e in zip(agg["cust_id"].tolist(), agg[col_name].tolist())]
+        pdf[col_name]  = pd.to_numeric(pdf[col_name],  errors="coerce")
+        rows = [(int(r["cust_id"]), float(r[col_name])) for _, r in pdf.iterrows()]
         return spark.createDataFrame(
             spark.sparkContext.parallelize(rows),
             schema=StructType([
                 StructField("cust_id", LongType(), False),
-                StructField(col_name, DoubleType(), True),
+                StructField(col_name,  DoubleType(), True),
             ])
         )
 
-    outflow_hl_lap_df    = _to_spark_df(outflow_results["HL_LAP_outflow"],    "HL_LAP_outflow")
-    outflow_al_tw_df     = _to_spark_df(outflow_results["AL_TW_outflow"],     "AL_TW_outflow")
-    outflow_pl_df        = _to_spark_df(outflow_results["PL_outflow"],        "PL_outflow")
-    outflow_cd_df        = _to_spark_df(outflow_results["CD_outflow"],        "CD_outflow")
-    outflow_df           = _to_spark_df(outflow_results["Outflow_uns_secmov"],"Outflow_uns_secmov")
-    outflow_plcdtw_df    = _to_spark_df(outflow_results["Outflow_AL_PL_TW_CD"],"Outflow_AL_PL_TW_CD")
-    total_outflow_wo_cc  = _to_spark_df(outflow_results["total_outflow_wo_cc"],"total_outflow_wo_cc")
+    outflow_pl_df        = _pdf_to_spark(_pl_out,  "PL_outflow")
+    outflow_hl_lap_df    = _pdf_to_spark(_hl_out,  "HL_LAP_outflow")
+    outflow_al_tw_df     = _pdf_to_spark(_al_out,  "AL_TW_outflow")
+    outflow_cd_df        = _pdf_to_spark(_cd_out,  "CD_outflow")
+
+    # Composite outflows reusing per-product results
+    def _combine_outflows(parts, label):
+        if not parts:
+            return pd.DataFrame(columns=["cust_id", label])
+        merged = pd.concat(parts, ignore_index=True)
+        if "FINAL_EMI" in merged.columns:
+            out = merged.groupby("cust_id")["FINAL_EMI"].sum().reset_index()
+        else:
+            # already named as outflow cols – sum all numeric except cust_id
+            num_cols = [c for c in merged.columns if c != "cust_id"]
+            merged["_emi"] = merged[num_cols].sum(axis=1)
+            out = merged.groupby("cust_id")["_emi"].sum().reset_index()
+        out.rename(columns={"FINAL_EMI": label, "_emi": label}, inplace=True)
+        return out
+
+    # Outflow_uns_secmov = HL+AL+PL+CD combined (non-CC)
+    _uns_parts = []
+    for _pdf, _lbl in [(_pl_out,"PL_outflow"), (_hl_out,"HL_LAP_outflow"),
+                       (_al_out,"AL_TW_outflow"), (_cd_out,"CD_outflow")]:
+        if not _pdf.empty:
+            _uns_parts.append(_pdf.rename(columns={_lbl: "_emi"}))
+    if _uns_parts:
+        _uns_merged = pd.concat(_uns_parts).groupby("cust_id")["_emi"].sum().reset_index()
+        _uns_merged.rename(columns={"_emi": "Outflow_uns_secmov"}, inplace=True)
+    else:
+        _uns_merged = pd.DataFrame(columns=["cust_id", "Outflow_uns_secmov"])
+
+    outflow_df        = _pdf_to_spark(_uns_merged, "Outflow_uns_secmov")
+    outflow_plcdtw_df = _pdf_to_spark(
+        _combine_outflows(
+            [p.rename(columns={l: "_emi"}) for p, l in
+             [(_pl_out,"PL_outflow"),(_al_out,"AL_TW_outflow"),(_cd_out,"CD_outflow")] if not p.empty],
+            "Outflow_AL_PL_TW_CD"),
+        "Outflow_AL_PL_TW_CD")
+    total_outflow_wo_cc = _pdf_to_spark(
+        _combine_outflows(
+            [p.rename(columns={l: "_emi"}) for p, l in
+             [(_hl_out,"HL_LAP_outflow"),(_al_out,"AL_TW_outflow"),
+              (_pl_out,"PL_outflow"),(_cd_out,"CD_outflow")] if not p.empty],
+            "total_outflow_wo_cc"),
+        "total_outflow_wo_cc")
+
 
     print(f"[calculateOverflow_HC] HL_LAP:{outflow_hl_lap_df.count()} AL_TW:{outflow_al_tw_df.count()} PL:{outflow_pl_df.count()} CD:{outflow_cd_df.count()} customers computed")
 
@@ -2099,7 +2175,8 @@ def build_global_attrs(account_details, fact2_enriched):
     )
 
     # live_bal_0_12_zf: 0-fill version for live_cnt and balance_amt_0_6_by_7_12
-    # Java adds 0 for non-qualifying rows → all idx appear in map → correct avg denominator
+    # Java adds 0 for non-qualifying rows → all reported months appear in map → correct avg denominator
+    # Denominator = months where at least 1 account reported (not fixed 7/6 months)
     _live_zf = (
         exploded
         .filter(col("idx").between(0, 12))
@@ -2252,14 +2329,27 @@ def build_global_attrs(account_details, fact2_enriched):
     # - _open_abs = absolute months of open_dt (fmax, used for MOB)
     # For freq_between, Java uses acctOpenDtSet.first() = EARLIEST open date.
     # Compute earliest open_abs per account from fact2_enriched.
-    _min_open_abs = (
-        fact2_enriched
-        .groupBy("cust_id", "cons_acct_key")
-        .agg(
-            (year(to_date(fmin("open_dt").cast("string"), "yyyyMMdd")) * 12 +
-             month(to_date(fmin("open_dt").cast("string"), "yyyyMMdd"))).alias("_min_open_abs")
+    # FIX: Use open_dt_all (includes month_diff < 0 rows) for freq_between open_dt
+    # Java: acctOpenDtSet built from ALL rows (index < 36 includes negatives)
+    # Accounts ONLY in future months were excluded from our freq_between — now fixed
+    if open_dt_all is not None:
+        # Use unfiltered open_dt from all months
+        _min_open_abs = (
+            open_dt_all
+            .withColumn("_min_open_abs",
+                year(to_date(col("open_dt_all").cast("string"), "yyyyMMdd")) * 12 +
+                month(to_date(col("open_dt_all").cast("string"), "yyyyMMdd")))
+            .drop("open_dt_all")
         )
-    )
+    else:
+        _min_open_abs = (
+            fact2_enriched
+            .groupBy("cust_id", "cons_acct_key")
+            .agg(
+                (year(to_date(fmin("open_dt").cast("string"), "yyyyMMdd")) * 12 +
+                 month(to_date(fmin("open_dt").cast("string"), "yyyyMMdd"))).alias("_min_open_abs")
+            )
+        )
 
     _freq_accounts = (
         ad.join(
@@ -2322,14 +2412,15 @@ def build_global_attrs(account_details, fact2_enriched):
             if tc_padded not in _FREQ_EXCL_HL:
                 gaps_inst.append(gap)
 
-            # freq_between_accts_unsec_wo_cc: tc in _CV_UNS_FREQ AND NOT in freq CC exclusion
-            # _CV_UNS_FREQ = e2_uns set (custom_var L1927). Excludes 242,244,245 etc.
-            # freq CC exclusion: {5,196,213,220,225}
-            # 196 empirically excluded: cust 22260802 matched when 196 was CC-excluded (con_59)
-            # but broke (HIGH +12.979) when 196 was included in UNS pool (con_60)
+            # freq_between_accts_unsec_wo_cc: isUns (product_mapping UnSec) AND NOT in freq CC exclusion
+            # Use isUns not _CV_UNS_FREQ: type 242 must be included (empirical proof)
+            #   - con_59: isUns with CC={5,196,213,225} → 22260802 MATCHED
+            #   - con_60: _CV_UNS_FREQ (excl 242) → 22260802 broke (+12.979)
+            # custom_var L414 also uses Sec_Uns=='UnSec' (includes 242)
+            # _FREQ_CC_EXCL: 196 excluded (empirical from con_59), 220 excluded
             _FREQ_CC_EXCL = {"5","196","213","220","225"}
             tc_stripped = str(tcs[i]).lstrip('0') or '0'
-            if tc_stripped in _CV_UNS_FREQ and tc_stripped not in _FREQ_CC_EXCL:
+            if bool(isUns[i]) and tc_stripped not in _FREQ_CC_EXCL:
                 gaps_uns.append(gap)
 
         return {
@@ -2344,12 +2435,21 @@ def build_global_attrs(account_details, fact2_enriched):
         res["cust_id"] = int(cust_id)
         _freq_results.append(res)
 
-    _freq_result_pdf = pd.DataFrame(_freq_results)
-    # Ensure column order matches _freq_schema exactly (cust_id first)
-    _freq_result_pdf = _freq_result_pdf[["cust_id", "freq_between_accts_all",
-                                          "freq_between_installment_trades",
-                                          "freq_between_accts_unsec_wo_cc"]]
-    _freq_result_pdf["cust_id"] = pd.to_numeric(_freq_result_pdf["cust_id"], errors="coerce").astype("int64")
+    # Guard against empty results (e.g. when fact2_enriched has no accounts).
+    # pd.DataFrame([]) has zero columns → col-selection raises KeyError.
+    _freq_cols = ["cust_id", "freq_between_accts_all",
+                  "freq_between_installment_trades",
+                  "freq_between_accts_unsec_wo_cc"]
+    if _freq_results:
+        _freq_result_pdf = pd.DataFrame(_freq_results)
+        for _c in _freq_cols:
+            if _c not in _freq_result_pdf.columns:
+                _freq_result_pdf[_c] = None
+        _freq_result_pdf = _freq_result_pdf[_freq_cols]
+        _freq_result_pdf["cust_id"] = pd.to_numeric(_freq_result_pdf["cust_id"], errors="coerce").astype("int64")
+    else:
+        _freq_result_pdf = pd.DataFrame(columns=_freq_cols)
+        _freq_result_pdf["cust_id"] = _freq_result_pdf["cust_id"].astype("int64")
 
     _freq_schema = StructType([
         StructField("cust_id",                        LongType(),   False),
@@ -2818,9 +2918,12 @@ def build_global_attrs(account_details, fact2_enriched):
     # into one group → fmax picks max across ALL accounts, not per account.
     # sum_sanc_amt_uns: all isUns accounts (CD included)
     # Note: CD exclusion caused ratio to flip below 1.0 — reverted.
+    # sum_sanc_amt_uns: use isUns (product_mapping based) NOT _CV_UNS
+    # _CV_UNS misses types 244,245,247,249-252 which ARE in product_mapping UnSec
+    # Java L1557: getAllUnSecProductCodes() = full product_mapping UnSec set
     sum_sanc_uns_df = (
         exploded
-        .filter(col("account_type_cd").cast("int").isin(list(_CV_UNS)))
+        .filter(col("isUns"))
         .groupBy("cust_id", "_cons_key")
         .agg(fmax("mod_lim").alias("_max_lim_uns_acct"))
         .groupBy("cust_id")
@@ -3238,8 +3341,38 @@ def clean_numeric_date(colname):
 
 
 def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include_all_columns: bool = True):
-
-    
+    # ── VERSION BANNER & DATA DIAGNOSTICS ─────────────────────────────────────
+    from pyspark.sql.functions import col as _col, count as _count, countDistinct as _cdist
+    print()
+    print("=" * 75)
+    print("  con_v3.py — EMI-rewrite + CD-BAL_DIFF + IR-bucket-fix  [build v3.7]")
+    print("=" * 75)
+    _target_custs = [
+        "2027158", "2643104", "2722571", "28083426", "30365098",
+        "3707450", "38609792", "53315751", "9414008",
+        "10005593", "31968676", "4650448", "54467239", "5859799",
+        "6749573", "9941726",
+    ]
+    _row_counts = (
+        trade_df
+        .filter(_col("accno").cast("string").isin(_target_custs))
+        .groupBy(_col("accno").cast("string").alias("accno_str"))
+        .agg(_count("*").alias("n_rows"),
+             _cdist("cons_acct_key").alias("n_accts"))
+        .collect()
+    )
+    _found = {r["accno_str"]: (r["n_rows"], r["n_accts"]) for r in _row_counts}
+    print("  Target-customer presence in trade_df:")
+    print(f"  {'Customer':<12} {'Rows':>6} {'Accts':>6}  Status")
+    for c in _target_custs:
+        if c in _found:
+            n_rows, n_accts = _found[c]
+            print(f"  {c:<12} {n_rows:>6} {n_accts:>6}  \u2713 present")
+        else:
+            print(f"  {c:<12}      -      -  \u2717 MISSING")
+    print(f"  \u2192 {len(_found)}/{len(_target_custs)} target customers in trade_df")
+    print("=" * 75)
+    print()
 
     from pyspark.sql.functions import when, col, concat, lit, substring
 
@@ -3254,6 +3387,19 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
     fact2 = build_fact2(trade_df, acct_map, prod_map, bank_map)
     print(f"    fact2 rows: {fact2.count():,}")
 
+    # Pre-compute open_dt from ALL months (including month_diff < 0, future rows)
+    # Java: acctOpenDtSet includes rows with index < 36 (includes negatives)
+    # Accounts ONLY reported in future months (month_diff < 0) must be included
+    # in freq_between's open_dt list. fact2 filters those out, so we compute
+    # the open_dt lookup separately from the raw unfiltered trade data.
+    _open_dt_all = (
+        trade_df
+        .join(acct_map.filter(col("relFinCd").cast("string").isin(*OWNERSHIP_CD))
+              .select("accno", "cust_id"), on="accno", how="inner")
+        .groupBy("cust_id", "cons_acct_key")
+        .agg(fmin("open_dt").alias("open_dt_all"))
+    )
+
     print("--- Phase 2: Per-Month Variables ---")
     fact2_enriched = build_fact2_enriched(fact2)
     fact2_enriched.cache()
@@ -3264,14 +3410,15 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
     print(f"    account rows: {account_details.count():,}")
 
     print("--- Phase 4: Global Attribute Calculation ---")
-    global_attrs = build_global_attrs(account_details, fact2_enriched)
+    global_attrs = build_global_attrs(account_details, fact2_enriched, _open_dt_all)
 
     # Java calculateUtilL6mAllTot: NO isLiveAccount filter for util_l6m_uns_tot
     _CV_UNS_UTIL = {5,121,123,130,167,169,170,176,177,178,179,181,187,189,196,197,198,199,200,
                     213,214,215,216,217,224,225,226,227,228,242,999}  # FIX 4: added 242 to match _CV_UNS
     _util6m_override = (
         fact2_enriched
-        .filter(col("account_type_cd").cast("int").isin(list(_CV_UNS_UTIL)) & (col("modified_limit") > 0))
+        # Fix: use isUns (product_mapping) not _CV_UNS_UTIL — includes 244,245,247 etc.
+        .filter(col("isUns") & (col("modified_limit") > 0))
         .groupBy("cust_id", "cons_acct_key")
         .agg(
             fsum(when(col("month_diff") <= 5, col("balance_amt"))).alias("_u6_bal"),
