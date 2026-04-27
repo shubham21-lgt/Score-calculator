@@ -1255,16 +1255,20 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             # Java L1393: only add util IF accountLevelBalanceAmount > 0
             # sum(util when bal>0) / count(all accounts with n>0)
             # FIX: wrap in F.when so 0/0 → 0 (Java behavior) instead of NaN (Spark)
+            # FIX 2: coalesce NULL numerator → 0. When all accounts have bal_l6m≤0,
+            # fsum(when bal>0, u) returns NULL (Spark) but Java returns 0 (initializer).
+            # This was producing NaN for 4384851 and 57696963 — accounts have valid n_l6m
+            # but negative bal_l6m, so denominator > 0 but numerator was NULL.
             F.when(fsum(when(col("_n_l3m")>0, lit(1))) > 0,
-                   fsum(when((col("_n_l3m")>0) & (col("_bal_l3m")>0), col("_u_l3m"))) /
+                   F.coalesce(fsum(when((col("_n_l3m")>0) & (col("_bal_l3m")>0), col("_u_l3m"))), lit(0.0)) /
                    fsum(when(col("_n_l3m")>0, lit(1))))
              .otherwise(lit(0.0)).alias("avg_util_l3m_all_tot"),
             F.when(fsum(when(col("_n_l6m")>0, lit(1))) > 0,
-                   fsum(when((col("_n_l6m")>0) & (col("_bal_l6m")>0), col("_u_l6m"))) /
+                   F.coalesce(fsum(when((col("_n_l6m")>0) & (col("_bal_l6m")>0), col("_u_l6m"))), lit(0.0)) /
                    fsum(when(col("_n_l6m")>0, lit(1))))
              .otherwise(lit(0.0)).alias("avg_util_l6m_all_tot"),
             F.when(fsum(when(col("_n_l12m")>0, lit(1))) > 0,
-                   fsum(when((col("_n_l12m")>0) & (col("_bal_l12m")>0), col("_u_l12m"))) /
+                   F.coalesce(fsum(when((col("_n_l12m")>0) & (col("_bal_l12m")>0), col("_u_l12m"))), lit(0.0)) /
                    fsum(when(col("_n_l12m")>0, lit(1))))
              .otherwise(lit(0.0)).alias("avg_util_l12m_all_tot"),
         )
