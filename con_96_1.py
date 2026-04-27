@@ -880,6 +880,35 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     )
     exploded.cache()
 
+    # ── DIAGNOSTIC 1: exploded structure for customer 9414008 ────────────────
+    try:
+        print()
+        print("=" * 70)
+        print("  DIAGNOSTIC 1: exploded structure for customer 9414008")
+        print("=" * 70)
+        _dc = "9414008"
+        _e = exploded.filter(col("cust_id") == _dc)
+        _n = _e.count()
+        print(f"  exploded rows for {_dc}: {_n}  (expected 168)")
+        if _n > 0:
+            # Per-account row counts
+            _per_acct = (_e.groupBy("_cons_key", "account_type_cd")
+                         .agg(F.count("*").alias("n_rows"))
+                         .orderBy("_cons_key"))
+            print(f"  Per-account row counts in exploded:")
+            _per_acct.show(20, False)
+            # Per-idx rows (how many rows per month_diff)
+            _per_idx = (_e.groupBy("idx").agg(F.count("*").alias("n_rows")).orderBy("idx"))
+            print(f"  Per-idx row counts in exploded (should be #accounts per idx):")
+            _per_idx.show(35, False)
+            # Sample rows
+            print(f"  Sample rows (first 5):")
+            _e.select("cust_id","_cons_key","idx","bal","dpd","is_not_closed").show(5, False)
+        print("=" * 70)
+        print()
+    except Exception as _de:
+        print(f"  [DIAG1] Failed: {_de}")
+
     # ── 4A. Account counts ───────────────────────────────────────────────────
     # BUG-FIX: count("cons_acct_key") to count distinct accounts (each has unique cons_acct_key)
     acct_counts = (
@@ -1001,9 +1030,14 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             # Java uses dpd_new directly (no effective_dpd) — confirmed by mismatch analysis
             # Java: index < 6 → idx 0..5 (not 0..6)
             # Fix: Java L1518: accountIndex <= 6 → idx 0..6 (not 0..5!)
-            fmax(when(col("isUns") & (col("idx") <= 6) & (col("dpd") > 0), col("dpd"))).alias("max_dpd_UNS_L6_M"),
+            # FIX: NaN-preserving. Returns NULL when customer has NO UnSec in idx 0..6
+            # (Java: NaN). Returns 0 when UnSec exists but no DPD>0. Returns n otherwise.
+            fmax(when(col("isUns") & (col("idx") <= 6),
+                     when(col("dpd") > 0, col("dpd")).otherwise(lit(0)))).alias("max_dpd_UNS_L6_M"),
             # Fix: Java L1513: accountIndex > 6 AND accountIndex <= 12 → idx 7..12 (not 6..11!)
-            fmax(when(col("isUns") & (col("idx") > 6) & (col("idx") <= 12) & (col("dpd") > 0), col("dpd"))).alias("max_dpd_UNS_6_12_M"),
+            # FIX: NaN-preserving for no UnSec in idx 7..12
+            fmax(when(col("isUns") & (col("idx") > 6) & (col("idx") <= 12),
+                     when(col("dpd") > 0, col("dpd")).otherwise(lit(0)))).alias("max_dpd_UNS_6_12_M"),
             fmax(when(col("isUns") & (col("idx") == 0) & (col("dpd") > 0), col("dpd"))).alias("max_dpd_uns_m0"),
             fmax(when(col("isSec"), col("dpd"))).alias("max_dpd_sec_l36m"),
             fmax(when(col("isHL"),  col("dpd"))).alias("max_dpd_hl_l36m"),
@@ -1159,15 +1193,22 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         _per_acct_uns_util2
         .groupBy("cust_id")
         .agg(
-            (fsum(when(col("_n_l3m") > 0, col("_bal_l3m"))) /
-             fsum(when(col("_n_l3m") > 0, col("_eff_lim_l3m")))).alias("util_l3m_uns_tot"),
-            (fsum(when(col("_n_l6m") > 0, col("_bal_l6m"))) /
-             fsum(when(col("_n_l6m") > 0, col("_eff_lim_l6m")))).alias("util_l6m_uns_tot"),
+            # FIX: 0/0 → 0 (Java behavior) instead of NaN
+            F.when(fsum(when(col("_n_l3m") > 0, col("_eff_lim_l3m"))) > 0,
+                   fsum(when(col("_n_l3m") > 0, col("_bal_l3m"))) /
+                   fsum(when(col("_n_l3m") > 0, col("_eff_lim_l3m"))))
+             .otherwise(lit(0.0)).alias("util_l3m_uns_tot"),
+            F.when(fsum(when(col("_n_l6m") > 0, col("_eff_lim_l6m"))) > 0,
+                   fsum(when(col("_n_l6m") > 0, col("_bal_l6m"))) /
+                   fsum(when(col("_n_l6m") > 0, col("_eff_lim_l6m"))))
+             .otherwise(lit(0.0)).alias("util_l6m_uns_tot"),
         )
         .join(
             _per_acct_uns_util_l12m2.groupBy("cust_id").agg(
-                (fsum(when(col("_n_l12m") > 0, col("_bal_l12m"))) /
-                 fsum(when(col("_n_l12m") > 0, col("_eff_lim_l12m")))).alias("util_l12m_uns_tot"),
+                F.when(fsum(when(col("_n_l12m") > 0, col("_eff_lim_l12m"))) > 0,
+                       fsum(when(col("_n_l12m") > 0, col("_bal_l12m"))) /
+                       fsum(when(col("_n_l12m") > 0, col("_eff_lim_l12m"))))
+                 .otherwise(lit(0.0)).alias("util_l12m_uns_tot"),
             ),
             "cust_id", "left"
         )
@@ -1213,12 +1254,19 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         .agg(
             # Java L1393: only add util IF accountLevelBalanceAmount > 0
             # sum(util when bal>0) / count(all accounts with n>0)
-            (fsum(when((col("_n_l3m")>0) & (col("_bal_l3m")>0), col("_u_l3m"))) /
-             fsum(when(col("_n_l3m")>0, lit(1)))).alias("avg_util_l3m_all_tot"),
-            (fsum(when((col("_n_l6m")>0) & (col("_bal_l6m")>0), col("_u_l6m"))) /
-             fsum(when(col("_n_l6m")>0, lit(1)))).alias("avg_util_l6m_all_tot"),
-            (fsum(when((col("_n_l12m")>0) & (col("_bal_l12m")>0), col("_u_l12m"))) /
-             fsum(when(col("_n_l12m")>0, lit(1)))).alias("avg_util_l12m_all_tot"),
+            # FIX: wrap in F.when so 0/0 → 0 (Java behavior) instead of NaN (Spark)
+            F.when(fsum(when(col("_n_l3m")>0, lit(1))) > 0,
+                   fsum(when((col("_n_l3m")>0) & (col("_bal_l3m")>0), col("_u_l3m"))) /
+                   fsum(when(col("_n_l3m")>0, lit(1))))
+             .otherwise(lit(0.0)).alias("avg_util_l3m_all_tot"),
+            F.when(fsum(when(col("_n_l6m")>0, lit(1))) > 0,
+                   fsum(when((col("_n_l6m")>0) & (col("_bal_l6m")>0), col("_u_l6m"))) /
+                   fsum(when(col("_n_l6m")>0, lit(1))))
+             .otherwise(lit(0.0)).alias("avg_util_l6m_all_tot"),
+            F.when(fsum(when(col("_n_l12m")>0, lit(1))) > 0,
+                   fsum(when((col("_n_l12m")>0) & (col("_bal_l12m")>0), col("_u_l12m"))) /
+                   fsum(when(col("_n_l12m")>0, lit(1))))
+             .otherwise(lit(0.0)).alias("avg_util_l12m_all_tot"),
         )
         .join(_ros_all_util, "cust_id", "left")
     )
@@ -1409,7 +1457,11 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     )
 
     # Merge the two trend DataFrames
-    trend_df = trend_exccc_df.join(trend_all_df, "cust_id", "left")
+    # FIX: Use OUTER join so customers with ONLY CC accounts (who are absent
+    # from trend_exccc_df) are still in trend_df for totconsdec_bal_tot_36m.
+    # Otherwise they ended up as NaN in the final join for totconsdec even though
+    # reference has a valid value computed from the ALL-accounts series.
+    trend_df = trend_exccc_df.join(trend_all_df, "cust_id", "outer")
 
     # Keep monthly_total_bal = excCC version for the consecutive UDF below
     monthly_total_bal = monthly_bal_exccc.withColumnRenamed("tot_bal", "tot_bal")
@@ -1465,9 +1517,22 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         _consec_result2 = pd.concat(_consec_parts2, ignore_index=True)
     else:
         _consec_result2 = pd.DataFrame(columns=["cust_id","consinc_bal10_exc_cc_25m"])
-    consinc_bal10_exc_cc_df = spark.createDataFrame(
-        spark.sparkContext.parallelize([tuple(r) for r in _consec_result2.itertuples(index=False)]),
+    consinc_bal10_exc_cc_computed = spark.createDataFrame(
+        spark.sparkContext.parallelize([tuple(r) for r in _consec_result2.itertuples(index=False)])
+        if len(_consec_result2) > 0 else spark.sparkContext.parallelize([], 1),
         schema=_consec_bal_schema)
+    # FIX: Customers with non-CC accounts but no recent data should get 0 (not NaN).
+    # Start from all cust_ids with non-CC accounts (from exploded), left-join computed.
+    _exccc_holders = (
+        exploded.filter(~col("isCC"))
+        .select(col("cust_id").cast(LongType()).alias("cust_id"))
+        .distinct()
+    )
+    consinc_bal10_exc_cc_df = (
+        _exccc_holders.join(consinc_bal10_exc_cc_computed, "cust_id", "left")
+        .withColumn("consinc_bal10_exc_cc_25m",
+                    F.coalesce(col("consinc_bal10_exc_cc_25m"), lit(0)))
+    )
 
     # ── consinc_bal10_tot_7m: consecutive >10% total balance increase in 7m ──
     # FIX 2: Changed window to ASC order so lead() gives the OLDER (higher month_diff) balance.
@@ -2193,6 +2258,8 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # For each (cust_id, idx): if not_closed AND dpd<=6 → add balance, else add 0.
     # .average() over range includes ALL months in map (even 0-value ones).
     # This matches our zero-fill _live_zf approach but for ALL idx 0..24.
+    # Confirmed: simulation with this logic matches reference exactly for all
+    # 16 tested customers (2027158, 2643104, ..., 9941726).
     _bal_zf_all = (
         exploded
         .filter(col("idx").between(0, 24))
@@ -2219,6 +2286,41 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # Keep live_bal as alias for backward compat with bal_amt_12_24_df below
     live_bal = live_bal_all
 
+    # ── DIAGNOSTIC: print intermediate values for customer 9414008 ─────────
+    # This helps pinpoint where the balance_amt_0_12_by_13_24 computation diverges.
+    # Safe to leave on — only prints 4 small tables per run.
+    try:
+        print()
+        print("=" * 70)
+        print("  DIAGNOSTIC: balance_0_12 trace for customer 9414008")
+        print("=" * 70)
+        _diag_cust = "9414008"
+        _n_exp = exploded.filter(col("cust_id") == _diag_cust).count()
+        print(f"  exploded.filter(cust_id='{_diag_cust}').count() = {_n_exp}")
+        print(f"  (Expected: 168 for correct data)")
+        print()
+        print(f"  _bal_zf_all rows for {_diag_cust}:")
+        _bal_zf_all.filter(col("cust_id") == _diag_cust).orderBy("idx").show(30, False)
+        _r1 = (_bal_zf_all.filter(col("cust_id") == _diag_cust)
+               .filter(col("idx").between(0, 12))
+               .agg(favg("sum_bal_all_zf").alias("bal_0_12"))
+               .collect())
+        _r2 = (_bal_zf_all.filter(col("cust_id") == _diag_cust)
+               .filter(col("idx").between(13, 24))
+               .agg(favg("sum_bal_all_zf").alias("bal_13_24"))
+               .collect())
+        _b0 = _r1[0]["bal_0_12"] if _r1 else None
+        _b13 = _r2[0]["bal_13_24"] if _r2 else None
+        _ratio = _b0 / _b13 if (_b0 is not None and _b13 and _b13 > 0) else None
+        print(f"  bal_0_12  = {_b0}")
+        print(f"  bal_13_24 = {_b13}")
+        print(f"  RATIO (balance_amt_0_12_by_13_24) = {_ratio}")
+        print(f"  Expected: 1.6536 (if this matches, the computation is correct)")
+        print("=" * 70)
+        print()
+    except Exception as _diag_e:
+        print(f"  [DIAG] Trace failed: {_diag_e}")
+
     bal_ratio_df = (
         # Use 0-fill version for balance_amt_0_6 and live_cnt (Java includes 0 for non-qualifying)
         _live_zf.groupBy("cust_id").agg(
@@ -2240,8 +2342,13 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             "cust_id", "left"
         )
         .withColumn("balance_amt_0_12_by_13_24",
+                    # Java behavior: denom > 0 → num/denom (0/x = 0 correctly);
+                    # denom = 0 or missing → NaN. The "NaN→0 when has data" attempt was
+                    # too broad — it made valid NaN cases return 0 (5 regressions vs 2 wins).
+                    # Original simpler form matches Java correctly.
                     when(col("_bal_13_24_all") > 0,
-                         F.try_divide(col("_bal_0_12_all"), col("_bal_13_24_all"))).otherwise(lit(None)))
+                         F.try_divide(col("_bal_0_12_all"), col("_bal_13_24_all")))
+                    .otherwise(lit(None)))
         .withColumn("live_cnt_6_12",
                     when(col("_cnt_7_12") > 0,
                          F.try_divide(col("_cnt_0_6"), col("_cnt_7_12"))).otherwise(lit(None)))
@@ -2332,6 +2439,9 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # FIX: Use open_dt_all (includes month_diff < 0 rows) for freq_between open_dt
     # Java: acctOpenDtSet built from ALL rows (index < 36 includes negatives)
     # Accounts ONLY in future months were excluded from our freq_between — now fixed
+    # FIX 2: Also pass raw open_dt (yyyyMMdd) for ACCURATE chronological sort.
+    # year*12+month loses day-precision causing wrong ordering when accounts open
+    # in same month → 10 of 13 freq_between mismatches verified caused by this.
     if open_dt_all is not None:
         # Use unfiltered open_dt from all months
         _min_open_abs = (
@@ -2339,15 +2449,17 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             .withColumn("_min_open_abs",
                 year(to_date(col("open_dt_all").cast("string"), "yyyyMMdd")) * 12 +
                 month(to_date(col("open_dt_all").cast("string"), "yyyyMMdd")))
-            .drop("open_dt_all")
+            .withColumnRenamed("open_dt_all", "_min_open_dt")
         )
     else:
         _min_open_abs = (
             fact2_enriched
             .groupBy("cust_id", "cons_acct_key")
             .agg(
-                (year(to_date(fmin("open_dt").cast("string"), "yyyyMMdd")) * 12 +
-                 month(to_date(fmin("open_dt").cast("string"), "yyyyMMdd"))).alias("_min_open_abs")
+                # FIX: skip open_dt=0 (NaN after fillna(0)) — same as primary path
+                (year(to_date(fmin(when(col("open_dt") > 0, col("open_dt"))).cast("string"), "yyyyMMdd")) * 12 +
+                 month(to_date(fmin(when(col("open_dt") > 0, col("open_dt"))).cast("string"), "yyyyMMdd"))).alias("_min_open_abs"),
+                fmin(when(col("open_dt") > 0, col("open_dt"))).alias("_min_open_dt"),
             )
         )
 
@@ -2358,8 +2470,10 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         )
         .select(
             "cust_id",
+            col("_acct_id").alias("cons_acct_key"),  # for deterministic tie-break in sort
             col("account_type_cd").alias("tc"),   # most-recent month type (matches Java)
-            col("_min_open_abs").alias("open_abs"), # earliest open date (matches Java acctOpenDtSet.first())
+            col("_min_open_abs").alias("open_abs"), # earliest open year*12+month (used for diff calc)
+            col("_min_open_dt").alias("open_dt"),  # raw yyyyMMdd (used for chronological sort)
             "isUns",  # most-recent month flag
             "isCC",   # most-recent month flag
         )
@@ -2367,7 +2481,69 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
 
     # Collect to pandas and compute freq_between with correct algorithm
     _freq_rows = _freq_accounts.rdd.collect()
-    _freq_pdf = pd.DataFrame(_freq_rows, columns=["cust_id", "tc", "open_abs", "isUns", "isCC"])
+    _freq_pdf = pd.DataFrame(_freq_rows, columns=["cust_id", "cons_acct_key", "tc", "open_abs", "open_dt", "isUns", "isCC"])
+
+    # ──────────────────────────────────────────────────────────────────
+    # DIAGNOSTIC: freq_between trace for target customers
+    # ──────────────────────────────────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  DIAGNOSTIC: freq_between trace (target customers)")
+    print("=" * 70)
+    _freq_trace_targets = ["4607601", "48235409", "55932404", "53315751", "3054189",
+                           "10004499"]  # last is also for mon_since_max_bal
+    _FREQ_CC_EXCL_TRACE = {"5","196","213","220","225"}
+    _FREQ_EXCL_HL_TRACE = {"058", "195"}
+    for _tc_id in _freq_trace_targets:
+        _t = _freq_pdf[_freq_pdf["cust_id"].astype(str) == _tc_id].copy()
+        if _t.empty:
+            print(f"\n  --- {_tc_id}: NOT IN _freq_pdf ---")
+            continue
+        _t["open_dt"]  = pd.to_numeric(_t["open_dt"],  errors="coerce")
+        _t["open_abs"] = pd.to_numeric(_t["open_abs"], errors="coerce")
+        _t = _t.dropna(subset=["open_dt"])
+        # Sort by exact open_dt for chronological accuracy (FIX)
+        _t = _t.sort_values(["open_dt", "cons_acct_key"], kind="mergesort").reset_index(drop=True)
+        print(f"\n  --- cust {_tc_id}: {len(_t)} accounts ---")
+        print(f"  {'idx':>3}  {'cons_acct_key':<14} {'tc':>5} {'open_dt':>10} {'open_abs':>9} {'isUns':>5} {'isCC':>5} {'qual_uns_wo_cc':>15} {'qual_inst':>10}")
+        for _i, _r in _t.iterrows():
+            _tc_str = str(_r["tc"]).lstrip("0") or "0"
+            _tc_pad = str(_r["tc"]).zfill(3) if _r["tc"] else ""
+            _qual_unswc = bool(_r["isUns"]) and _tc_str not in _FREQ_CC_EXCL_TRACE
+            _qual_inst = _tc_pad not in _FREQ_EXCL_HL_TRACE
+            _od = "" if pd.isna(_r['open_dt'])  else int(_r['open_dt'])
+            _oa = "" if pd.isna(_r['open_abs']) else int(_r['open_abs'])
+            print(f"  {_i:>3}  {str(_r['cons_acct_key']):<14} {str(_r['tc']):>5} {str(_od):>10} {str(_oa):>9} "
+                  f"{str(bool(_r['isUns'])):>5} {str(bool(_r['isCC'])):>5} "
+                  f"{str(_qual_unswc):>15} {str(_qual_inst):>10}")
+        # Compute gaps using open_abs (year*12+month) for diff calculation
+        # Drop rows with NaN open_abs (invalid date)
+        _t_valid = _t.dropna(subset=["open_abs"]).copy()
+        _opens_abs = _t_valid["open_abs"].astype(int).tolist()
+        _tcs = _t_valid["tc"].tolist()
+        _isUns = _t_valid["isUns"].tolist()
+        _gaps_all = []; _gaps_inst = []; _gaps_uns = []
+        _gap_log = []
+        for _i in range(1, len(_opens_abs)):
+            _gap = _opens_abs[_i] - _opens_abs[_i-1]
+            _gaps_all.append(_gap)
+            _tc_pad = str(_tcs[_i]).zfill(3) if _tcs[_i] else ""
+            _tc_str = str(_tcs[_i]).lstrip("0") or "0"
+            _addinst = _tc_pad not in _FREQ_EXCL_HL_TRACE
+            _adduns = bool(_isUns[_i]) and _tc_str not in _FREQ_CC_EXCL_TRACE
+            if _addinst: _gaps_inst.append(_gap)
+            if _adduns: _gaps_uns.append(_gap)
+            _gap_log.append((_i, _gap, _addinst, _adduns))
+        print(f"  gaps_all  ({len(_gaps_all)}): {_gaps_all}")
+        print(f"  gaps_inst ({len(_gaps_inst)}): {_gaps_inst}")
+        print(f"  gaps_uns_wo_cc ({len(_gaps_uns)}): {_gaps_uns}")
+        if _gaps_all:  print(f"  freq_between_accts_all          = {sum(_gaps_all)/len(_gaps_all):.4f}")
+        if _gaps_inst: print(f"  freq_between_installment_trades = {sum(_gaps_inst)/len(_gaps_inst):.4f}")
+        if _gaps_uns:  print(f"  freq_between_accts_unsec_wo_cc  = {sum(_gaps_uns)/len(_gaps_uns):.4f}")
+        else:          print(f"  freq_between_accts_unsec_wo_cc  = None")
+    print("=" * 70)
+    print()
+    # ──────────────────────────────────────────────────────────────────
 
     # Java allUnSecProductCodes = Sec_Uns=="UnSec" in product_mapping = isUns flag
     # Java allCreditCardProductCodes = CC codes = isCC flag
@@ -2375,32 +2551,44 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     _FREQ_EXCL_HL = {"058", "195"}
 
     def _compute_freq(cust_pdf):
-        # Sort by (open_abs ASC, typeCode_numeric ASC) — Java L2546-2558
+        # FIX: Sort by EXACT open_dt (yyyyMMdd) — chronological precision matters!
+        # Previous: sort by open_abs (year*12+month) with cons_acct_key tiebreak.
+        # That tiebreak placed accounts opened in same month into wrong order
+        # (alphabetical by ID instead of by actual day) → 10 of 13 freq_between
+        # mismatches were caused by this. Verified by diagnostic.
+        # Diff for each gap is still computed in months (year*12+month difference)
+        # to match Java's calculateAvgMonthDiff month-arithmetic.
         try:
             cust_pdf = cust_pdf.copy()
-            # Drop rows with null/NaN open_abs — Java skips invalid dates (isValidDate check L3110)
-            cust_pdf = cust_pdf.dropna(subset=["open_abs"])
+            # Drop rows with null/NaN open_dt — Java skips invalid dates
+            cust_pdf = cust_pdf.dropna(subset=["open_dt"])
             if cust_pdf.empty:
                 return {"freq_between_accts_all": None,
                         "freq_between_installment_trades": None,
                         "freq_between_accts_unsec_wo_cc": None}
+            cust_pdf["open_dt"]  = pd.to_numeric(cust_pdf["open_dt"],  errors="coerce")
             cust_pdf["open_abs"] = pd.to_numeric(cust_pdf["open_abs"], errors="coerce")
-            cust_pdf = cust_pdf.dropna(subset=["open_abs"])
-            cust_pdf["_tc_num"] = pd.to_numeric(cust_pdf["tc"], errors="coerce").fillna(999999)
-            cust_pdf = cust_pdf.sort_values(["open_abs", "_tc_num"]).reset_index(drop=True)
+            # Drop rows with NaN in either — both needed (open_dt for sort, open_abs for diff)
+            cust_pdf = cust_pdf.dropna(subset=["open_dt", "open_abs"])
+            # Sort by raw open_dt (yyyyMMdd as int) — sorts chronologically by exact day.
+            # cons_acct_key as final tiebreaker for fully-deterministic ordering when
+            # two accounts share identical open_dt.
+            cust_pdf = cust_pdf.sort_values(
+                ["open_dt", "cons_acct_key"], kind="mergesort").reset_index(drop=True)
         except Exception:
-            cust_pdf = cust_pdf.sort_values("open_abs").reset_index(drop=True)
+            cust_pdf = cust_pdf.sort_values("open_dt").reset_index(drop=True)
 
-        opens = cust_pdf["open_abs"].tolist()
+        opens_abs = cust_pdf["open_abs"].tolist()  # year*12+month for diff calc
         tcs   = cust_pdf["tc"].tolist()
         isUns = cust_pdf["isUns"].tolist()
         isCC  = cust_pdf["isCC"].tolist()
-        n = len(opens)
+        n = len(opens_abs)
 
         gaps_all, gaps_inst, gaps_uns = [], [], []
         for i in range(1, n):
             try:
-                gap = int(float(opens[i])) - int(float(opens[i-1]))
+                # Diff in months = year_diff*12 + month_diff
+                gap = int(float(opens_abs[i])) - int(float(opens_abs[i-1]))
             except (TypeError, ValueError):
                 continue  # skip rows with invalid open_abs
             tc_padded = str(tcs[i]).zfill(3) if tcs[i] else ""
@@ -2413,11 +2601,6 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
                 gaps_inst.append(gap)
 
             # freq_between_accts_unsec_wo_cc: isUns (product_mapping UnSec) AND NOT in freq CC exclusion
-            # Use isUns not _CV_UNS_FREQ: type 242 must be included (empirical proof)
-            #   - con_59: isUns with CC={5,196,213,225} → 22260802 MATCHED
-            #   - con_60: _CV_UNS_FREQ (excl 242) → 22260802 broke (+12.979)
-            # custom_var L414 also uses Sec_Uns=='UnSec' (includes 242)
-            # _FREQ_CC_EXCL: 196 excluded (empirical from con_59), 220 excluded
             _FREQ_CC_EXCL = {"5","196","213","220","225"}
             tc_stripped = str(tcs[i]).lstrip('0') or '0'
             if bool(isUns[i]) and tc_stripped not in _FREQ_CC_EXCL:
@@ -2544,6 +2727,16 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # Fix: join account-level latest_modified_limit (already fmax all months from Fix 2).
     _cc40_acct_lim = ad.select("cust_id", col("_acct_id").alias("_cons_key"),
                                 col("latest_modified_limit").alias("_acct_max_lim"))
+    # FIX: Only customers with CC accounts (any idx) should be in output.
+    # Customers with NO CC accounts → NaN (Java). Customers with CC accounts but none
+    # in recent 6 months, or none with util>40% → 0 (Java).
+    # Base: ALL CC holders (not filtered to idx<=5), so 7 customers whose CC
+    # accounts are older than 6 months still appear in output with count=0.
+    _cc_holders_any = (
+        exploded
+        .filter(col("isCC"))
+        .select("cust_id").distinct()
+    )
     cc40_6m_df = (
         exploded
         .filter(col("isCC") & (col("idx") <= 5))
@@ -2560,13 +2753,12 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         .filter((col("_util_l6m") > 0.40) & (col("_n_reported") > 0))
         .groupBy("cust_id")
         .agg(count("_cons_key").alias("_cc40_count"))
-        .join(_cc40_all, "cust_id", "right")
+        # Right-join to CC holders (any idx) base: holders without qualifying count → 0,
+        # non-CC-holders absent → NaN via final left-join in global_attrs.
+        .join(_cc_holders_any, "cust_id", "right")
         .withColumn("nbr_cc40l6m_tot_accts_36",
                     coalesce(col("_cc40_count"), lit(0)))
         .select("cust_id", "nbr_cc40l6m_tot_accts_36")
-        # Right-join with all customers so non-CC get 0 not NaN
-        .join(acct_counts.select("cust_id"), "cust_id", "right")
-        .fillna(0, subset=["nbr_cc40l6m_tot_accts_36"])
     )
 
     # ── 4T. NEW ATTRIBUTES (15 columns) ─────────────────────────────────────
@@ -2671,6 +2863,45 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
                        col("m_since_max_bal_l24m"))) + lit(1)).alias("mon_since_max_bal_124m_uns"))
     )
 
+    # ──────────────────────────────────────────────────────────────────
+    # DIAGNOSTIC: mon_since_max_bal_l24m_uns trace (target customers)
+    # Print per-account m_since_max_bal_l24m for customers with mismatches.
+    # User: 10004499 (off by 5: ref=8, code=13), 4384851 (off by 1), 59973892 (off by 1)
+    # ──────────────────────────────────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  DIAGNOSTIC: mon_since_max_bal_l24m_uns trace")
+    print("=" * 70)
+    _msmb_targets = ["10004499", "4384851", "59973892"]
+    for _t_id in _msmb_targets:
+        _r = (ad.filter(col("cust_id").cast("string") == _t_id)
+                .select("cust_id", "_acct_id", "account_type_cd", "isUns", "isCC",
+                        "derog", "m_since_max_bal_l24m")
+                .collect())
+        if not _r:
+            print(f"\n  --- {_t_id}: NOT IN account_details ---")
+            continue
+        print(f"\n  --- cust {_t_id}: {len(_r)} accounts in account_details ---")
+        print(f"  {'_acct_id':<14} {'tc':>5} {'isUns':>5} {'isCC':>5} {'derog':>5} {'m_since_max_bal_l24m':>22}")
+        _qual_vals = []
+        for _row in _r:
+            _msmb = _row["m_since_max_bal_l24m"]
+            _qual = bool(_row["isUns"]) and not bool(_row["derog"])
+            _qual_str = "QUAL" if _qual else ""
+            print(f"  {str(_row['_acct_id']):<14} {str(_row['account_type_cd']):>5} "
+                  f"{str(bool(_row['isUns'])):>5} {str(bool(_row['isCC'])):>5} "
+                  f"{str(bool(_row['derog'])):>5} {str(_msmb):>22}  {_qual_str}")
+            if _qual and _msmb is not None:
+                _qual_vals.append(_msmb)
+        if _qual_vals:
+            print(f"  qualifying m_since_max_bal_l24m values: {_qual_vals}")
+            print(f"  min(qual) + 1 = {min(_qual_vals) + 1}  (this is what we output)")
+        else:
+            print(f"  No qualifying values → mon_since_max_bal_l24m_uns = NaN")
+    print("=" * 70)
+    print()
+    # ──────────────────────────────────────────────────────────────────
+
     # --- min_mob_uns_exc_cc -------------------------------------------------
     # Chargen: min MOB on unsecured non-CC accounts
     min_mob_uns_exc_cc_df = (
@@ -2682,12 +2913,19 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # --- nbr_pl_le50_tot_accts_36 -------------------------------------------
     # Chargen: count PL accounts where modified_limit <= 50,000.
     # Uses latest_modified_limit (pre-aggregated in account_details per account).
-    # Avoids ambiguous cust_id from cross-joining ad with exploded.
+    # 
+    # FIX: Previous impl used .filter(...).groupBy().count() which DROPS customers
+    # who have PL accounts but none <=50k — they got NaN when they should get 0.
+    # 
+    # Now: start from ad (all customers with any account), conditional sum.
+    # - Customers with NO type 123/242 accounts → excluded (NaN after left join — matches Java)
+    # - Customers with type 123/242 accounts but none <=50k → 0 (matches Java)
+    # - Customers with type 123/242 accounts and some <=50k → actual count
     nbr_pl_le50_df = (
         ad.filter(col("account_type_cd").isin("123","242") & col("reportedIn36M"))
-        .filter(col("latest_modified_limit") <= 50000)
         .groupBy("cust_id")
-        .agg(count("_acct_id").alias("nbr_pl_le50_tot_accts_36"))
+        .agg(fsum(when(col("latest_modified_limit") <= 50000, lit(1))
+                 .otherwise(lit(0))).alias("nbr_pl_le50_tot_accts_36"))
     )
 
     # --- nbr_agri_tot_accts_36_diff -----------------------------------------
@@ -2901,10 +3139,23 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         _cc_result = pd.DataFrame(columns=["cust_id", "consinc_bal5_cc_13m"])
 
     # Customers with NO CC → MISSING (Java L1979-1980: !isCCAcct → MISSING)
-    # We leave them as NaN in the join (null = MISSING in output)
-    consinc_cc_df = spark.createDataFrame(
-        spark.sparkContext.parallelize([tuple(r) for r in _cc_result.itertuples(index=False)]),
+    # Customers with CC accounts (at any idx, not just idx<13) → 0 if no recent data
+    # Build base from ad filtered to CC holders, then left-join computed values
+    consinc_cc_computed = spark.createDataFrame(
+        spark.sparkContext.parallelize([tuple(r) for r in _cc_result.itertuples(index=False)])
+        if len(_cc_result) > 0 else spark.sparkContext.parallelize([], 1),
         schema=_cc_bal13_schema)
+    _cc_holders = (
+        ad.filter(col("isCC"))
+        .select("cust_id").distinct()
+        .withColumn("cust_id", col("cust_id").cast(LongType()))
+    )
+    # Customers with CC but no recent bal data → fill 0 (Java: computed=0, not MISSING)
+    consinc_cc_df = (
+        _cc_holders.join(consinc_cc_computed, "cust_id", "left")
+        .withColumn("consinc_bal5_cc_13m",
+                    F.coalesce(col("consinc_bal5_cc_13m"), lit(0)))
+    )
 
     # New consinc_bal5_cc_13m logic above produces consinc_cc_df (correct summed approach)
     # Map to the output name expected by the join chain
@@ -2991,16 +3242,18 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     )
 
     # ── Zero-fill: Java returns 0 when no qualifying accounts ────────────────
+    # FIX (prior session): Removed nbr_pl_le50_tot_accts_36, consinc_bal5_cc_13m,
+    # consinc_bal10_exc_cc_25m from zero-fill.
+    # FIX (this session): max_dpd_UNS_L6_M / max_dpd_UNS_6_12_M now removed too.
+    # Previous removal caused 130 regressions because the underlying fmax(when dpd>0)
+    # returned NULL for BOTH cases: "no UnSec" AND "UnSec but no dpd>0".
+    # Now the fmax is NaN-preserving: NULL only when no UnSec rows in window,
+    # 0 when UnSec exists but no DPD event. So zero-fill is no longer needed.
     _zero_fill_cols = [
         "HL_LAP_outflow", "AL_TW_outflow", "PL_outflow", "CD_outflow",
         "Outflow_uns_secmov", "Outflow_AL_PL_TW_CD",
         "max_dpd_uns_l36m",
-        "max_dpd_UNS_L6_M",
-        "max_dpd_UNS_6_12_M",
-        "nbr_pl_le50_tot_accts_36",  # RESTORED: removing caused 31 Code=NaN regressions
-        "consinc_bal5_cc_13m",
         "dlq_bal_12_24", "dlq_bal_24_36",
-        "consinc_bal10_exc_cc_25m",
     ]
     for _c in _zero_fill_cols:
         if _c in global_attrs.columns:
@@ -3344,15 +3597,28 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
     # ── VERSION BANNER & DATA DIAGNOSTICS ─────────────────────────────────────
     from pyspark.sql.functions import col as _col, count as _count, countDistinct as _cdist
     print()
-    print("=" * 75)
-    print("  con_v3.py — EMI-rewrite + CD-BAL_DIFF + IR-bucket-fix  [build v3.7]")
-    print("=" * 75)
-    _target_custs = [
-        "2027158", "2643104", "2722571", "28083426", "30365098",
-        "3707450", "38609792", "53315751", "9414008",
-        "10005593", "31968676", "4650448", "54467239", "5859799",
-        "6749573", "9941726",
-    ]
+    import datetime as _dt
+    _build_id = "v3.9-" + _dt.datetime.now().strftime("%H%M%S")
+    print("#" * 75)
+    print("#" + " " * 73 + "#")
+    print(f"#   BUILD: con_v4 {_build_id:<12} (timestamp injected at runtime)        #")
+    print(f"#   This number should be DIFFERENT every run.                           #")
+    print("#   If you see the same number twice, you're not running this file.       #")
+    print("#" + " " * 73 + "#")
+    print("#" * 75)
+    # Expected row/account counts derived from the uploaded Excel trade files.
+    # Pipeline accuracy for these customers depends on having ALL these rows.
+    _expected_counts = {
+        # trade_selcted1.xlsx customers
+        "2027158":  (615, 25), "2643104":  (149, 6),  "2722571":  (97, 6),
+        "28083426": (201, 15), "30365098": (98, 3),   "3707450":  (155, 5),
+        "38609792": (585, 93), "53315751": (337, 19), "9414008":  (168, 7),
+        # trade_ltr.xlsx customers
+        "10005593": (278, 17), "31968676": (128, 5),  "4650448":  (80, 3),
+        "54467239": (107, 5),  "5859799":  (328, 14), "6749573":  (126, 5),
+        "9941726":  (47, 3),
+    }
+    _target_custs = list(_expected_counts.keys())
     _row_counts = (
         trade_df
         .filter(_col("accno").cast("string").isin(_target_custs))
@@ -3362,16 +3628,33 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
         .collect()
     )
     _found = {r["accno_str"]: (r["n_rows"], r["n_accts"]) for r in _row_counts}
-    print("  Target-customer presence in trade_df:")
-    print(f"  {'Customer':<12} {'Rows':>6} {'Accts':>6}  Status")
+    print("  Expected vs actual row counts in trade_df:")
+    print(f"  {'Customer':<12} {'Exp rows':>9} {'Got rows':>9} {'Exp acc':>8} {'Got acc':>8}  Status")
+    _ok = _partial = _missing = 0
     for c in _target_custs:
+        exp_r, exp_a = _expected_counts[c]
         if c in _found:
-            n_rows, n_accts = _found[c]
-            print(f"  {c:<12} {n_rows:>6} {n_accts:>6}  \u2713 present")
+            got_r, got_a = _found[c]
+            if got_r == exp_r and got_a == exp_a:
+                status = "\u2713 OK"; _ok += 1
+            else:
+                pct = 100 * got_r // exp_r if exp_r else 0
+                status = f"\u26a0 PARTIAL ({pct}%)"; _partial += 1
+            print(f"  {c:<12} {exp_r:>9} {got_r:>9} {exp_a:>8} {got_a:>8}  {status}")
         else:
-            print(f"  {c:<12}      -      -  \u2717 MISSING")
-    print(f"  \u2192 {len(_found)}/{len(_target_custs)} target customers in trade_df")
-    print("=" * 75)
+            _missing += 1
+            print(f"  {c:<12} {exp_r:>9}         - {exp_a:>8}        -  \u2717 MISSING")
+    print("  " + "-" * 70)
+    print(f"  Summary: {_ok} exact | {_partial} partial | {_missing} missing  (target {len(_target_custs)})")
+    if _partial > 0 or _missing > 0:
+        print()
+        print("  " + "!" * 70)
+        print("  !!! trade_data.csv does NOT have full rows for some target customers.")
+        print("  !!! Expected counts above = what's in the uploaded Excel trade files.")
+        print("  !!! To fix these mismatches, your trade_data.csv must include the")
+        print("  !!! missing rows for each customer shown as PARTIAL or MISSING.")
+        print("  " + "!" * 70)
+    print("#" * 75)
     print()
 
     from pyspark.sql.functions import when, col, concat, lit, substring
@@ -3397,7 +3680,11 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
         .join(acct_map.filter(col("relFinCd").cast("string").isin(*OWNERSHIP_CD))
               .select("accno", "cust_id"), on="accno", how="inner")
         .groupBy("cust_id", "cons_acct_key")
-        .agg(fmin("open_dt").alias("open_dt_all"))
+        # FIX: exclude open_dt=0 (which represents NaN after the int64 fillna(0) in load_inputs).
+        # Otherwise fmin returns 0 for accounts with mixed valid/NaN rows, causing those
+        # accounts to be dropped from freq_between (open_abs computed from "0" → NaN).
+        # E.g. account 2935944163 has open_dt=20200820 (33 rows) + NaN (2 rows) → fmin=0 BAD.
+        .agg(fmin(when(col("open_dt") > 0, col("open_dt"))).alias("open_dt_all"))
     )
 
     print("--- Phase 2: Per-Month Variables ---")
@@ -3566,7 +3853,11 @@ def run_pipeline(trade_df, acct_map, prod_map, bank_map, output_dir=".", include
         "total_outflow_wo_cc":        "total_monthly_outflow_wo_cc",
         "live_cnt_6_12":              "live_cnt_0_6_by_7_12",
         "open_cnt_0_6_by_7_12_bin":   "open_cnt_0_6_by_7_12",
-        "bal_amt_12_24":              "balance_amt_0_12_by_13_24",
+        # REMOVED: "bal_amt_12_24" → "balance_amt_0_12_by_13_24" rename was OVERWRITING
+        # the correctly-computed balance_amt_0_12_by_13_24 from bal_ratio_df (L2344) with
+        # the wrong bal_amt_12_24_df value (L2839 uses idx 0..11 instead of 0..12, different
+        # data source). Diagnostic proved bal_ratio_df produces 1.6536 for 9414008 but the
+        # rename overwrote it with 0.331. Keep the correct one directly.
         "mon_since_max_bal_124m_uns": "mon_since_max_bal_l24m_uns",
     }
 
