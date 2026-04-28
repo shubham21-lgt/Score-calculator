@@ -830,22 +830,50 @@ def build_account_details(fact2_enriched):
 # PHASE 4 — GLOBAL ATTRIBUTE CALCULATION
 # ===========================================================================
 
-def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
-    # Rename cons_acct_key to _acct_id to eliminate AMBIGUOUS_REFERENCE.
-    # build_account_details groups by cons_acct_key and joins DataFrames that also
-    # carry cons_acct_key — Spark sees the name twice in the column lineage.
-    # Using a private alias throughout Phase 4 avoids this completely.
-    ad = account_details.withColumnRenamed("cons_acct_key", "_acct_id")
-    fe = fact2_enriched
 
-    _CV_UNS = {5,121,123,130,167,169,170,176,177,178,179,181,187,189,
-               196,197,198,199,200,213,214,215,216,217,
-               224,225,226,227,228,999, 242}  # 242 added: UnSec in product_mapping
 
-    # ── Exploded monthly data (used by multiple sub-phases) ──────────────────
-    # _cons_key = cons_acct_key (true unique account key).
-    # Embedded once into exploded so every downstream groupBy uses it directly —
-    # no per-DataFrame _acct_key_map joins needed (eliminates 11 repeated joins).
+# ════════════════════════════════════════════════════════════════════════════
+#                                                                            ░
+#   PHASE 4 HELPER FUNCTIONS — Business-Domain Modules                       ░
+#                                                                            ░
+#   These functions decompose build_global_attrs into independently testable ░
+#   units, each computing one business metric or related family of metrics.  ░
+#                                                                            ░
+#   Execution order (called by build_global_attrs in this sequence):         ░
+#     1.  prepare_monthly_exploded            — shared base for all metrics  ░
+#     2.  count_accounts_by_product_type      — 4A: account inventory        ░
+#     3.  count_accounts_opened_by_window     — 4B: open-month windows       ░
+#     4.  derive_max_dpd_attributes           — 4C: delinquency severity     ░
+#     5.  calculate_max_sanction_secured      — secured loan max sanction    ░
+#     6.  build_per_account_utilization_bases — per-account util building    ░
+#     7.  calculate_credit_utilization_unsecured                             ░
+#     8.  calculate_credit_utilization_all                                   ░
+#     9.  calculate_credit_utilization_excluding_cc                          ░
+#    10.  calculate_credit_utilization_cc_only                               ░
+#                                                                            ░
+#   All other business modules (cashflow, trends, simultaneity, balance     ░
+#   ratios, frequency, recency, CC-40 metrics, etc.) currently remain        ░
+#   inline within build_global_attrs and can be extracted incrementally      ░
+#   following the same pattern shown here.                                   ░
+#                                                                            ░
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def prepare_monthly_exploded(ad):
+    """Explode account_details.monthly_data into per-(account, month) rows.
+
+    BUSINESS LOGIC:
+        Each account has up to 36 monthly snapshots stored as a struct array.
+        Many downstream metrics are computed per-month (DPD trends, balance
+        trends, utilization windows). This function flattens the nested
+        structure into a wide table indexed by (cust_id, account, month_idx).
+
+    Output columns:
+        cust_id, accno, _cons_key, account_type_cd, product flags
+        (isCC..isSFB), idx (0=current, 35=oldest), dpd, raw_dpd, bal,
+        mod_lim, asset_cd, wo_status, sfw_status, acct_status, past_due,
+        row_derog (per-month derog), is_not_closed.
+    """
     exploded = (
         ad.select(
             "cust_id", "accno",
@@ -879,36 +907,25 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         )
     )
     exploded.cache()
+    return exploded
 
-    # ── DIAGNOSTIC 1: exploded structure for customer 9414008 ────────────────
-    try:
-        print()
-        print("=" * 70)
-        print("  DIAGNOSTIC 1: exploded structure for customer 9414008")
-        print("=" * 70)
-        _dc = "9414008"
-        _e = exploded.filter(col("cust_id") == _dc)
-        _n = _e.count()
-        print(f"  exploded rows for {_dc}: {_n}  (expected 168)")
-        if _n > 0:
-            # Per-account row counts
-            _per_acct = (_e.groupBy("_cons_key", "account_type_cd")
-                         .agg(F.count("*").alias("n_rows"))
-                         .orderBy("_cons_key"))
-            print(f"  Per-account row counts in exploded:")
-            _per_acct.show(20, False)
-            # Per-idx rows (how many rows per month_diff)
-            _per_idx = (_e.groupBy("idx").agg(F.count("*").alias("n_rows")).orderBy("idx"))
-            print(f"  Per-idx row counts in exploded (should be #accounts per idx):")
-            _per_idx.show(35, False)
-            # Sample rows
-            print(f"  Sample rows (first 5):")
-            _e.select("cust_id","_cons_key","idx","bal","dpd","is_not_closed").show(5, False)
-        print("=" * 70)
-        print()
-    except Exception as _de:
-        print(f"  [DIAG1] Failed: {_de}")
 
+def count_accounts_by_product_type(exploded, ad):
+    """4A — Account inventory counts by product category and reporting window.
+
+    BUSINESS LOGIC:
+        Counts accounts per customer by product category, split by:
+          - 36-month reporting window (ever-reported)
+          - "live" accounts (currently active)
+          - first 6 months of MOB
+
+        Categories: total, secured, unsecured, comsec, comunsec, regsec,
+        reguns, agri, regular, CC, HL, AL, TW, GL, GLext, PL, CL,
+        plcd_tw, lap_hl. Counts are NaN-preserving — returns NaN when
+        NO accounts of a type exist (matches Java/org_car grp_nansum).
+
+    Returns: DataFrame keyed on cust_id with all account-count attributes.
+    """
     # ── 4A. Account counts ───────────────────────────────────────────────────
     # BUG-FIX: count("cons_acct_key") to count distinct accounts (each has unique cons_acct_key)
     acct_counts = (
@@ -961,7 +978,22 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             fmax(when(col("isCC"), col("mob"))).alias("max_mob_cc_36"),
         )
     )
+    return acct_counts
 
+
+def count_accounts_opened_by_window(exploded, ad):
+    """4B — Accounts opened by month-of-business (MOB) window.
+
+    BUSINESS LOGIC:
+        Counts MONTHLY RECORDS where reporting month equals open month
+        (idx==mob) AND modified_limit > 0. Used to compute the
+        openCnt0_6By7_12Bin attribute family — measures concentration
+        of recent (last 6m) vs older (7-12m) account opening activity.
+
+        Java reference: bru.py L1800-1812 (calcOpenCntBin).
+
+    Returns: DataFrame keyed on cust_id with opened-window count metrics.
+    """
     # ── 4B. Accounts opened by mob window ────────────────────────────────────
     # _open_cnt sub-DF: Java openCnt0_6By7_12Bin (bru.py L1800-1812)
     # counts MONTHLY RECORDS where diff(acctDt, openDate)==0 AND modifiedLimit>0
@@ -975,6 +1007,7 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             fsum(when(col("idx").between(7, 12), lit(1))).alias("_open_cnt_7to12m"),
         )
     )
+
     accts_opened = (
         ad.groupBy("cust_id").agg(
             fsum(when((col("mob") <= 3) & (col("mob") > 0), lit(1))).alias("nbr_accts_open_l3m"),
@@ -999,22 +1032,26 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             fmin("mob").alias("mon_since_last_acct_open"),
         )
     )
+    return _open_cnt_df, accts_opened
 
-    # ── 4C. Max DPD attributes ───────────────────────────────────────────────
-    # FIX 12b: dpd_new_udf returns 0 when balance_amt <= 500, even if real DPD > 0.
-    # This masks DPD events on low-balance accounts. For max_dpd_L30M and max_dpd_uns_l36m
-    # we use a combined signal: max(dpd_new_bucket, any_dpd_event_via_raw_dpd).
-    # Specifically: if raw_dpd > 0 AND dpd_new == 0 (because bal<=500), we still
-    # count it as a bucket-1 event (1-30 DPD) at minimum, so max won't be 0.
-    # This restores the 10004499 case: raw DPD > 0 at some idx, but dpd_new=0 due to bal<=500.
-    def _effective_dpd(dpd_col, raw_dpd_col):
-        """Returns dpd_new when >0, else returns 1 if raw_dpd>0 (bal<=500 mask), else 0."""
-        return (
-            when(col(dpd_col) > 0, col(dpd_col))
-            .when(col(raw_dpd_col) > 0, lit(1))   # real DPD event masked by balance guard
-            .otherwise(lit(0))
-        )
 
+def derive_max_dpd_attributes(exploded, ad):
+    """4C — Maximum Days-Past-Due (DPD) metrics across multiple time windows.
+
+    BUSINESS LOGIC:
+        DPD measures payment delinquency severity. Computes:
+          - max_dpd_uns_l36m / l12m         — worst unsecured DPD ever / 12m
+          - max_dpd_UNS_L6_M / L6_12_M      — worst unsec DPD in 6m / 6-12m
+          - max_dpd_uns_m0                  — current-month unsec DPD
+          - max_dpd_*_l3m / l6m / l12m_*    — same family for various subsets
+          - min_mon_sin_recent_*            — months since last DPD>X event
+
+        max_dpd_UNS_L6_M / L6_12_M use NaN-preserving formulation: returns
+        NaN when no unsecured rows exist in the window (Java distinguishes
+        "no data" from "data but no DPD = 0").
+
+    Returns: DataFrame keyed on cust_id with all DPD attributes.
+    """
     dpd_attrs = (
         exploded.groupBy("cust_id").agg(
             fmax(col("dpd")).alias("max_dpd_all_l36m"),
@@ -1074,17 +1111,55 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             fmax(when(col("dpd") == 7, col("idx"))).alias("mon_sin_first_7"),
         )
     )
+    return dpd_attrs
 
-    
-    # ────────────────────────────────────────────────────────────────
-    # 4D. Utilisation metrics (Correct final sequence)
-    # ────────────────────────────────────────────────────────────────
 
-    # # 1. Live-account filter
-    # _live_for_util = (
-    #     ad.select("cust_id", "accno", "isLiveAccount")
-    #       .filter(col("isLiveAccount") == True)
-    # )
+def calculate_max_sanction_secured(exploded):
+    """Maximum sanctioned amount on Secured accounts within 36-month window.
+
+    BUSINESS LOGIC:
+        Finds the largest mod_lim (sanction) ever observed on any Secured
+        account in the 36-month reporting window. Two variants:
+          - max_sanc_amt_sec        — across ALL Secured accounts
+          - max_sanc_amt_secmov_real — across SecMov subset only
+
+    Returns: DataFrame keyed on cust_id with max_sanc attributes.
+    """
+    max_sanc_amt_sec_df = (
+        exploded
+        .filter(col("mod_lim").isNotNull())
+        .groupBy("cust_id")
+        .agg(
+            fmax(when(col("isSec") & (col("idx") <= 35), col("mod_lim"))).alias("max_sanc_amt_sec"),
+            fmax(when(col("isSecMov") & (col("idx") <= 35), col("mod_lim"))).alias("max_sanc_amt_secmov_real"),
+        )
+    )
+    return max_sanc_amt_sec_df
+
+
+def build_per_account_utilization_bases(exploded, ad):
+    """Per-account utilization base DataFrames — shared by all utilization metrics.
+
+    BUSINESS LOGIC:
+        Utilization = balance / limit, averaged over a window. For correct
+        customer-level aggregation we need three TYPES of base:
+          (a) avg-of-ratios across ALL accounts        → _per_acct_all_util
+          (b) avg-of-ratios across UNSECURED accounts  → _per_acct_uns_util
+          (c) sum-of-ratios numerator/denominator      → _per_acct_uns_util2
+
+        Each base groups exploded by (cust_id, _cons_key) and produces
+        balance sums, month counts, mod_lim, and per-account util ratios
+        for L3M/L6M/L12M windows.
+
+        Also builds _live_for_util (live-account filter), shared by the
+        excluding-CC and CC-only utilization functions.
+
+    Returns: tuple of 6 DataFrames:
+        (_live_for_util,
+         _per_acct_all_util, _per_acct_uns_util, _per_acct_uns_util_l12m,
+         _per_acct_uns_util2, _per_acct_uns_util_l12m2)
+    """
+    # Live-account filter (used by _per_acct_uns_util2 and _per_acct_uns_util_l12m2)
     _live_for_util = (
         ad.select(
             "cust_id",
@@ -1095,22 +1170,6 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         .filter(F.col("isLiveAccount") == True)
     )
 
-    # _cons_key is now embedded directly in exploded (see exploded build above)
-
-    # FIX 1: Removed duplicate max_sanc_amt_sec_df definition (was defined twice;
-    # first copy at line ~910 was shadowed and wasted computation).
-    # max_sanc_amt_sec  = max sanction on ALL Secured accounts (36m window)
-    # max_sanc_amt_secmov_real = SecMov accounts ONLY (Sec_Mov='SecMov')
-    max_sanc_amt_sec_df = (
-        exploded
-        .filter(col("mod_lim").isNotNull())
-        .groupBy("cust_id")
-        .agg(
-            fmax(when(col("isSec") & (col("idx") <= 35), col("mod_lim"))).alias("max_sanc_amt_sec"),
-            fmax(when(col("isSecMov") & (col("idx") <= 35), col("mod_lim"))).alias("max_sanc_amt_secmov_real"),
-        )
-    )
-    # ────────────────────────────────────────────────────────────────
     # 3. ALL-accounts per-account utilisation (avg-of-ratios)
     # FIX E: Java L1384-1395: denominator = max(mod_lim) × count(ALL months in window).
     # OLD: filter(mod_lim > 0) undercounted months. NEW: all rows, Java-exact denom.
@@ -1189,6 +1248,25 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         .withColumn("_eff_lim_l12m",
                     when(col("_lim") > 0, col("_lim") * col("_n_l12m")).otherwise(lit(0.001)))
     )
+    return (_live_for_util,
+            _per_acct_all_util, _per_acct_uns_util, _per_acct_uns_util_l12m,
+            _per_acct_uns_util2, _per_acct_uns_util_l12m2)
+
+
+def calculate_credit_utilization_unsecured(_per_acct_uns_util, _per_acct_uns_util_l12m,
+                                            _per_acct_uns_util2, _per_acct_uns_util_l12m2):
+    """Customer-level utilization metrics for UNSECURED accounts.
+
+    BUSINESS LOGIC:
+        Two computations from the same per-account base:
+          1. avg_util_*_uns_tot  = mean(per_account_util) across uns accts
+             (each account weighted equally)
+          2. util_*_uns_tot      = sum(bal) / sum(lim)
+             (each account weighted by its limit)
+        Both computed for L3M / L6M / L12M / live windows.
+
+    Returns: DataFrame keyed on cust_id with all unsecured-utilization metrics.
+    """
     util_uns_df = (
         _per_acct_uns_util2
         .groupBy("cust_id")
@@ -1213,10 +1291,21 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             "cust_id", "left"
         )
     )
+    return util_uns_df
 
-    # ────────────────────────────────────────────────────────────────
-    # 5. Ratio‑of‑sums util for ALL accounts (alternative to avg-of-ratios; matches org_car)
-    # ────────────────────────────────────────────────────────────────
+
+def calculate_credit_utilization_all(_per_acct_all_util, exploded):
+    """Customer-level utilization metrics across ALL accounts (any product).
+
+    BUSINESS LOGIC:
+        Mirrors the unsecured version but uses the all-accounts per-account
+        base. Includes the FIX where avg_util_*_all_tot wraps the numerator
+        with F.coalesce(_, lit(0.0)) — when ALL accounts have bal_l6m <= 0,
+        fsum returns NULL but Java initializes to 0.
+
+    Returns: DataFrame keyed on cust_id with all-utilization metrics joined
+             with the corresponding ROS (return-on-sales-style) totals.
+    """
     # FIX D: _ros_all_per_acct — Java L1317-1321: count ALL months (not just mod_lim>0);
     # denom per account = max_lim × count or 0.001 (MODIFIED_LIMIT_DEFAULT).
     _ros_all_per_acct = (
@@ -1274,9 +1363,20 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         )
         .join(_ros_all_util, "cust_id", "left")
     )
+    return util_all_df
 
-    # FIX C: util_l3m_exc_cc_live — Java L1186-1192: denominator = accountMaxLimit × counter3Months
-    # per account, then sum across accounts. Old code summed per-row mod_lim (wrong).
+
+def calculate_credit_utilization_excluding_cc(_per_acct_all_util, _live_for_util, exploded):
+    """Customer-level utilization across NON-CREDIT-CARD accounts only.
+
+    BUSINESS LOGIC:
+        Filters _per_acct_all_util to exclude CC accounts (isCC==False)
+        before customer-level aggregation. Same avg-of-ratios + sum-totals
+        split as the all-accounts version, applied to the non-CC subset.
+        Used to derive util_*_exc_cc_tot and avg_util_*_exc_cc_tot families.
+
+    Returns: DataFrame keyed on cust_id with exc-CC utilization metrics.
+    """
     _util_exc_cc_per_acct = (
         exploded
         .join(_live_for_util, ["cust_id", "_cons_key"], "inner")
@@ -1298,11 +1398,21 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             F.try_divide(fsum("_bal_l3m"), fsum("_denom")).alias("util_l3m_exc_cc_live"),
         )
     )
-    # ────────────────────────────────────────────────────────────────
+    return util_exc_cc_df
 
-    # util_l3m_cc_live — Java calculateUtilL3mCcLive: ratio-of-sums across CC LIVE accounts
-    # FIX: must filter on isLiveAccount (account-level live flag from account_details),
-    # not just is_not_closed (row-level). is_not_closed can be True for old closed rows
+
+def calculate_credit_utilization_cc_only(exploded, _live_for_util):
+    """Customer-level utilization across CREDIT CARD accounts only.
+
+    BUSINESS LOGIC:
+        Computed on LIVE accounts (current month, isCC=True, mod_lim > 0).
+        Two computations per window:
+          - avg_util_*_cc_live  — mean per-account util ratio across live CCs
+          - util_*_cc_live      — sum(bal)/sum(lim) weighted total
+        Windows: L3M / L6M / L12M.
+
+    Returns: DataFrame keyed on cust_id with cc-only utilization metrics.
+    """
     # that still appear within the 36m window; isLiveAccount reflects the final status.
     _cc_live_per_acct = (
         exploded
@@ -1339,6 +1449,111 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             fmax(when(col("_cc_n_l3m") > 0, F.try_divide(col("_cc_bal_l3m"), col("_cc_lim")))).alias("util_m0_cc"),
         )
     )
+    return util_cc_df
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  END HELPER FUNCTIONS — build_global_attrs orchestrator follows           ░
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
+    # Rename cons_acct_key to _acct_id to eliminate AMBIGUOUS_REFERENCE.
+    # build_account_details groups by cons_acct_key and joins DataFrames that also
+    # carry cons_acct_key — Spark sees the name twice in the column lineage.
+    # Using a private alias throughout Phase 4 avoids this completely.
+    ad = account_details.withColumnRenamed("cons_acct_key", "_acct_id")
+    fe = fact2_enriched
+
+    _CV_UNS = {5,121,123,130,167,169,170,176,177,178,179,181,187,189,
+               196,197,198,199,200,213,214,215,216,217,
+               224,225,226,227,228,999, 242}  # 242 added: UnSec in product_mapping
+
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   PHASE 4 ORCHESTRATION — call business-domain helper functions
+    # ─────────────────────────────────────────────────────────────────────────
+    # Each helper returns a customer-level DataFrame. They are joined together
+    # in the FINAL ASSEMBLY block at the end of this function.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # 1. Shared base — exploded monthly snapshots
+    exploded = prepare_monthly_exploded(ad)
+
+    # ── DIAGNOSTIC 1: exploded structure for customer 9414008 ────────────────
+    try:
+        print()
+        print("=" * 70)
+        print("  DIAGNOSTIC 1: exploded structure for customer 9414008")
+        print("=" * 70)
+        _dc = "9414008"
+        _e = exploded.filter(col("cust_id") == _dc)
+        _n = _e.count()
+        print(f"  exploded rows for {_dc}: {_n}  (expected 168)")
+        if _n > 0:
+            # Per-account row counts
+            _per_acct = (_e.groupBy("_cons_key", "account_type_cd")
+                         .agg(F.count("*").alias("n_rows"))
+                         .orderBy("_cons_key"))
+            print(f"  Per-account row counts in exploded:")
+            _per_acct.show(20, False)
+            # Per-idx rows (how many rows per month_diff)
+            _per_idx = (_e.groupBy("idx").agg(F.count("*").alias("n_rows")).orderBy("idx"))
+            print(f"  Per-idx row counts in exploded (should be #accounts per idx):")
+            _per_idx.show(35, False)
+            # Sample rows
+            print(f"  Sample rows (first 5):")
+            _e.select("cust_id","_cons_key","idx","bal","dpd","is_not_closed").show(5, False)
+        print("=" * 70)
+        print()
+    except Exception as _de:
+        print(f"  [DIAG1] Failed: {_de}")
+
+    # 2. Account inventory — counts of accounts by product/category/window
+    acct_counts = count_accounts_by_product_type(exploded, ad)
+
+    # 3. Accounts opened by MOB window (recent vs older)
+    #    _open_cnt_df is also needed downstream in the FINAL ASSEMBLY join
+    _open_cnt_df, accts_opened = count_accounts_opened_by_window(exploded, ad)
+
+    # 4. Maximum DPD attributes (delinquency severity across windows)
+    dpd_attrs = derive_max_dpd_attributes(exploded, ad)
+
+    # 5. Maximum sanctioned amount on Secured accounts
+    max_sanc_amt_sec_df = calculate_max_sanction_secured(exploded)
+
+    # 6. Build per-account utilization base DataFrames + live-account filter
+    (_live_for_util,
+     _per_acct_all_util, _per_acct_uns_util, _per_acct_uns_util_l12m,
+     _per_acct_uns_util2, _per_acct_uns_util_l12m2) = build_per_account_utilization_bases(exploded, ad)
+
+    # 7. Customer-level utilization — UNSECURED accounts
+    util_uns_df = calculate_credit_utilization_unsecured(
+        _per_acct_uns_util, _per_acct_uns_util_l12m,
+        _per_acct_uns_util2, _per_acct_uns_util_l12m2)
+
+    # 8. Customer-level utilization — ALL accounts
+    util_all_df = calculate_credit_utilization_all(_per_acct_all_util, exploded)
+
+    # 9. Customer-level utilization — EXCLUDING CC accounts
+    util_exc_cc_df = calculate_credit_utilization_excluding_cc(_per_acct_all_util, _live_for_util, exploded)
+
+    # 10. Customer-level utilization — CC ACCOUNTS ONLY
+    util_cc_df = calculate_credit_utilization_cc_only(exploded, _live_for_util)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #   REMAINING BUSINESS MODULES — currently inline below.
+    #   To be extracted into named functions following the pattern above:
+    #     • Exposure / current-balance summary (4E)
+    #     • Trend percentages over time
+    #     • Cashflow / outflow by loan type
+    #     • Balance ratios (0-12 vs 13-24 windows)
+    #     • Account simultaneity metrics
+    #     • Account opening frequency & recency
+    #     • CC-40% utilization metrics
+    #     • Special-case attributes (agri, derog months, bank concentration)
+    #     • FINAL ASSEMBLY — all per-customer DataFrames left-joined → global_attrs
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ── 4E. Exposure / balance amounts ──────────────────────────────────────
     exp_df = (
@@ -1427,6 +1642,54 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
                       lit(1)).otherwise(lit(0))).alias("totconsinc_bal5_exc_cc_7m"),
         )
     )
+
+    # ──────────────────────────────────────────────────────────────────
+    # DIAGNOSTIC: totconsinc_bal*_exc_cc trace for customer 8713231
+    # User's pipeline gives code=3 for bal10_exc_cc_25m but sc2_3=4
+    # User's pipeline gives code=3 for bal5_exc_cc_7m but sc2_3=2
+    # Show the raw monthly balances and pct_chg to understand the mismatch
+    # ──────────────────────────────────────────────────────────────────
+    print()
+    print("=" * 70)
+    print("  DIAGNOSTIC: totconsinc_bal*_exc_cc trace for 8713231")
+    print("=" * 70)
+    _trc = (monthly_bal_exccc.filter(col("cust_id").cast("string") == "8713231")
+            .withColumn("prev_bal", lead("tot_bal").over(w_trend))
+            .withColumn("pct_chg",
+                        when(col("prev_bal") > 0,
+                             F.try_divide(col("tot_bal") - col("prev_bal"), col("prev_bal")))
+                        .otherwise(lit(None)))
+            .orderBy("month_diff").collect())
+    print(f"  monthly_bal_exccc rows for 8713231: {len(_trc)}")
+    print(f"  {'idx':>3} {'tot_bal':>14} {'prev_bal':>14} {'pct_chg':>10} {'>0.10?':>7} {'>0.05?':>7}")
+    _cnt_25m_10 = 0; _cnt_25m_5 = 0; _cnt_7m_10 = 0; _cnt_7m_5 = 0
+    for _r in _trc:
+        _md = _r["month_diff"]; _tb = _r["tot_bal"]; _pb = _r["prev_bal"]; _pc = _r["pct_chg"]
+        _b10 = _pc is not None and _pc > 0.10
+        _b5  = _pc is not None and _pc > 0.05
+        if 1 <= _md <= 23 and _b10: _cnt_25m_10 += 1
+        if 1 <= _md <= 23 and _b5:  _cnt_25m_5  += 1
+        if 1 <= _md <= 5  and _b10: _cnt_7m_10  += 1
+        if 1 <= _md <= 5  and _b5:  _cnt_7m_5   += 1
+        _tb_s = f"{_tb:.2f}" if _tb is not None else "None"
+        _pb_s = f"{_pb:.2f}" if _pb is not None else "None"
+        _pc_s = f"{_pc:.4f}" if _pc is not None else "None"
+        print(f"  {_md:>3} {_tb_s:>14} {_pb_s:>14} {_pc_s:>10} {str(_b10):>7} {str(_b5):>7}")
+    print(f"  totconsinc_bal10_exc_cc_25m (md∈[1,23], pct>0.10) = {_cnt_25m_10}  (sc2_3=4)")
+    print(f"  totconsinc_bal5_exc_cc_25m  (md∈[1,23], pct>0.05) = {_cnt_25m_5}")
+    print(f"  totconsinc_bal10_exc_cc_7m  (md∈[1,5],  pct>0.10) = {_cnt_7m_10}")
+    print(f"  totconsinc_bal5_exc_cc_7m   (md∈[1,5],  pct>0.05) = {_cnt_7m_5}  (sc2_3=2)")
+    # Try also with extended range md∈[0,23]
+    _alt_25m_10 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 23
+                       and _r["pct_chg"] is not None and _r["pct_chg"] > 0.10)
+    _alt_7m_5 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 5
+                       and _r["pct_chg"] is not None and _r["pct_chg"] > 0.05)
+    print(f"  ALT bal10_25m (md∈[0,23]): {_alt_25m_10}")
+    print(f"  ALT bal5_7m   (md∈[0,5]):  {_alt_7m_5}")
+    print("=" * 70)
+    print()
+    # ──────────────────────────────────────────────────────────────────
+
 
     # totconsdec — based on ALL accounts with missing months filled as 0 (Java DEFAULT_LONG_VALUE=0L)
     # Java: for missing index in accountBalMap → defaults to 0. Missing month = 0 balance.
@@ -3339,6 +3602,7 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
 # PHASE 5 — SCORECARD TRIGGER & FINAL SCORE
 # ===========================================================================
 
+
 def compute_trigger_eligibility(account_details):
     ad = account_details
 
@@ -3551,46 +3815,6 @@ def compute_final_score(global_attrs_with_trigger):
         .drop("_score_result")
     )
 
-
-# ===========================================================================
-# PHASE 6 — PIPELINE ORCHESTRATOR
-# ===========================================================================
-# cols = [
-#     "accno",
-#     "cons_acct_key",
-#     "open_dt",
-#     "acct_nb",
-#     "closed_dt",
-#     "bureau_mbr_id",
-#     "account_type_cd",
-#     "term_freq",
-#     "charge_off_amt",
-#     "resp_code",
-#     "balance_dt",
-#     "account_status_cd",
-#     "actual_pymnt_amt",
-#     "balance_amt",
-#     "credit_lim_amt",
-#     "original_loan_amt",
-#     "past_due_amt",
-#     "pay_rating_cd",
-#     "dayspastdue",
-#     "written_off_amt",
-#     "principal_written_off",
-#     "SUITFILED_WILFULDEFAULT",
-#     "SUITFILEDWILLFULDEFAULT",
-#     "WRITTEN_OFF_AND_SETTLED"
-# ]
-
-
-
-
-# cols = ["accno","cons_acct_key","open_dt","acct_nb","closed_dt","bureau_mbr_id","account_type_cd","term_freq"]
-
-# trade_df.select(cols).show(truncate=False)
-# fact2.select(cols).show(truncate=False)
-
-# cols = ["accno","cust_id","account_type_cd","balance_amt","credit_lim_amt","original_loan_amt","past_due_amt","dayspastdue","account_status_cd","dpd_new"]
 
     # Fix open_dt
 def clean_numeric_date(colname):
