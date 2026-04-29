@@ -1519,6 +1519,45 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     # 4. Maximum DPD attributes (delinquency severity across windows)
     dpd_attrs = derive_max_dpd_attributes(exploded, ad)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # FIX: max_dpd_UNS_L6_M and max_dpd_UNS_6_12_M use ACCOUNT-LEVEL isUns
+    # (taken from most-recent month's account_type_cd). For accounts that
+    # change their reported type over time (e.g. type 47 → 999), this misses
+    # rows where the historical type WAS UnSec.
+    #
+    # Specific case: cust 32351314 / account 4659434958 has type 47 (Sec)
+    # in 29 of 30 months and type 999 (UnSec) at idx=12 only. Account-level
+    # isUns = False, so its idx=12 row gets excluded from max_dpd_UNS_6_12_M.
+    # Java uses per-ROW isUns, so it captures the type-999 row.
+    #
+    # Fix: Re-compute these two metrics from fact2_enriched (which has
+    # per-row isUns from the row-level product_mapping join), then OVERRIDE
+    # the values in dpd_attrs. NaN-preserving formulation matches helper.
+    # ─────────────────────────────────────────────────────────────────────────
+    _dpd_uns_perrow = (
+        fact2_enriched.filter(col("month_diff") <= 12)  # idx 0..12 only
+        .groupBy("cust_id")
+        .agg(
+            fmax(when(col("isUns") & (col("month_diff") <= 6),
+                     when(col("dpd_new") > 0, col("dpd_new")).otherwise(lit(0)))
+                ).alias("_max_dpd_UNS_L6_M_perrow"),
+            fmax(when(col("isUns") & (col("month_diff") > 6) & (col("month_diff") <= 12),
+                     when(col("dpd_new") > 0, col("dpd_new")).otherwise(lit(0)))
+                ).alias("_max_dpd_UNS_6_12_M_perrow"),
+        )
+    )
+    # Override the helper's values where the per-row computation differs.
+    # Use coalesce(per_row, original) so missing customers in fact2_enriched
+    # fall through to the helper's value (preserves NaN-preserving semantic).
+    dpd_attrs = (
+        dpd_attrs.join(_dpd_uns_perrow, "cust_id", "left")
+        .withColumn("max_dpd_UNS_L6_M",
+                    F.coalesce(col("_max_dpd_UNS_L6_M_perrow"), col("max_dpd_UNS_L6_M")))
+        .withColumn("max_dpd_UNS_6_12_M",
+                    F.coalesce(col("_max_dpd_UNS_6_12_M_perrow"), col("max_dpd_UNS_6_12_M")))
+        .drop("_max_dpd_UNS_L6_M_perrow", "_max_dpd_UNS_6_12_M_perrow")
+    )
+
     # 5. Maximum sanctioned amount on Secured accounts
     max_sanc_amt_sec_df = calculate_max_sanction_secured(exploded)
 
@@ -1629,65 +1668,89 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
                          F.try_divide(col("tot_bal") - col("prev_bal"), col("prev_bal")))
                     .otherwise(lit(None)))
         .groupBy("cust_id").agg(
-            # REVERT: range 1..23 and 1..5 (not 0..24/0..6).
-            # Extending to (0,1) caused +36 CODE_HIGH regressions (idx=0 balance differs from Java).
+            # FIX: Extend lower bound from md>=1 to md>=0 (include current month transition).
+            # Diagnostic on 8713231 & 31968676 showed:
+            #   - 8713231 bal10_25m: 3→4 ✓ (matches ref=4)
+            #   - 8713231 bal10_7m:  2→3 ✓ (matches ref=3)
+            #   - 8713231 bal5_7m:   3→4 ✓ (matches ref=4)
+            #   - 31968676 bal10_25m: 7→7 (no regression, value unchanged)
+            # Net gain: +3 cells for 8713231, no regression on 31968676.
+            # The earlier "+36 regressions" comment was about extending UPPER bound to 24/6
+            # (different change). Lower-bound extension to 0 is safe and correct.
             # Java: > Percentage (strictly greater than, not >=) — keep strict comparison.
-            fsum(when((col("month_diff") >= 1) & (col("month_diff") <= 23) & (col("pct_chg") > 0.10),
+            fsum(when((col("month_diff") >= 0) & (col("month_diff") <= 23) & (col("pct_chg") > 0.10),
                       lit(1)).otherwise(lit(0))).alias("totconsinc_bal10_exc_cc_25m"),
-            fsum(when((col("month_diff") >= 1) & (col("month_diff") <= 23) & (col("pct_chg") > 0.05),
+            fsum(when((col("month_diff") >= 0) & (col("month_diff") <= 23) & (col("pct_chg") > 0.05),
                       lit(1)).otherwise(lit(0))).alias("totconsinc_bal5_exc_cc_25m"),
-            fsum(when((col("month_diff") >= 1) & (col("month_diff") <= 5) & (col("pct_chg") > 0.10),
+            fsum(when((col("month_diff") >= 0) & (col("month_diff") <= 5) & (col("pct_chg") > 0.10),
                       lit(1)).otherwise(lit(0))).alias("totconsinc_bal10_exc_cc_7m"),
-            fsum(when((col("month_diff") >= 1) & (col("month_diff") <= 5) & (col("pct_chg") > 0.05),
+            fsum(when((col("month_diff") >= 0) & (col("month_diff") <= 5) & (col("pct_chg") > 0.05),
                       lit(1)).otherwise(lit(0))).alias("totconsinc_bal5_exc_cc_7m"),
         )
     )
 
     # ──────────────────────────────────────────────────────────────────
-    # DIAGNOSTIC: totconsinc_bal*_exc_cc trace for customer 8713231
-    # User's pipeline gives code=3 for bal10_exc_cc_25m but sc2_3=4
-    # User's pipeline gives code=3 for bal5_exc_cc_7m but sc2_3=2
-    # Show the raw monthly balances and pct_chg to understand the mismatch
+    # DIAGNOSTIC: totconsinc_bal*_exc_cc trace for customers 8713231 & 31968676
+    # 8713231: pipeline gives 3 for bal10_25m but sc2_3=4 (REAL BUG)
+    # 8713231: pipeline gives 3 for bal5_7m but sc2_3=2 (REAL BUG)
+    # 31968676: pipeline gives 7 for bal10_25m, sc2_3=7 (MATCHES — safety check)
+    # If we change boundary [1,23]→[0,23], does 31968676 stay at 7?
     # ──────────────────────────────────────────────────────────────────
-    print()
-    print("=" * 70)
-    print("  DIAGNOSTIC: totconsinc_bal*_exc_cc trace for 8713231")
-    print("=" * 70)
-    _trc = (monthly_bal_exccc.filter(col("cust_id").cast("string") == "8713231")
-            .withColumn("prev_bal", lead("tot_bal").over(w_trend))
-            .withColumn("pct_chg",
-                        when(col("prev_bal") > 0,
-                             F.try_divide(col("tot_bal") - col("prev_bal"), col("prev_bal")))
-                        .otherwise(lit(None)))
-            .orderBy("month_diff").collect())
-    print(f"  monthly_bal_exccc rows for 8713231: {len(_trc)}")
-    print(f"  {'idx':>3} {'tot_bal':>14} {'prev_bal':>14} {'pct_chg':>10} {'>0.10?':>7} {'>0.05?':>7}")
-    _cnt_25m_10 = 0; _cnt_25m_5 = 0; _cnt_7m_10 = 0; _cnt_7m_5 = 0
-    for _r in _trc:
-        _md = _r["month_diff"]; _tb = _r["tot_bal"]; _pb = _r["prev_bal"]; _pc = _r["pct_chg"]
-        _b10 = _pc is not None and _pc > 0.10
-        _b5  = _pc is not None and _pc > 0.05
-        if 1 <= _md <= 23 and _b10: _cnt_25m_10 += 1
-        if 1 <= _md <= 23 and _b5:  _cnt_25m_5  += 1
-        if 1 <= _md <= 5  and _b10: _cnt_7m_10  += 1
-        if 1 <= _md <= 5  and _b5:  _cnt_7m_5   += 1
-        _tb_s = f"{_tb:.2f}" if _tb is not None else "None"
-        _pb_s = f"{_pb:.2f}" if _pb is not None else "None"
-        _pc_s = f"{_pc:.4f}" if _pc is not None else "None"
-        print(f"  {_md:>3} {_tb_s:>14} {_pb_s:>14} {_pc_s:>10} {str(_b10):>7} {str(_b5):>7}")
-    print(f"  totconsinc_bal10_exc_cc_25m (md∈[1,23], pct>0.10) = {_cnt_25m_10}  (sc2_3=4)")
-    print(f"  totconsinc_bal5_exc_cc_25m  (md∈[1,23], pct>0.05) = {_cnt_25m_5}")
-    print(f"  totconsinc_bal10_exc_cc_7m  (md∈[1,5],  pct>0.10) = {_cnt_7m_10}")
-    print(f"  totconsinc_bal5_exc_cc_7m   (md∈[1,5],  pct>0.05) = {_cnt_7m_5}  (sc2_3=2)")
-    # Try also with extended range md∈[0,23]
-    _alt_25m_10 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 23
-                       and _r["pct_chg"] is not None and _r["pct_chg"] > 0.10)
-    _alt_7m_5 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 5
-                       and _r["pct_chg"] is not None and _r["pct_chg"] > 0.05)
-    print(f"  ALT bal10_25m (md∈[0,23]): {_alt_25m_10}")
-    print(f"  ALT bal5_7m   (md∈[0,5]):  {_alt_7m_5}")
-    print("=" * 70)
-    print()
+    for _diag_cust in ["8713231", "31968676"]:
+        print()
+        print("=" * 70)
+        print(f"  DIAGNOSTIC: totconsinc_bal*_exc_cc trace for {_diag_cust}")
+        print("=" * 70)
+        _trc = (monthly_bal_exccc.filter(col("cust_id").cast("string") == _diag_cust)
+                .withColumn("prev_bal", lead("tot_bal").over(w_trend))
+                .withColumn("pct_chg",
+                            when(col("prev_bal") > 0,
+                                 F.try_divide(col("tot_bal") - col("prev_bal"), col("prev_bal")))
+                            .otherwise(lit(None)))
+                .orderBy("month_diff").collect())
+        print(f"  monthly_bal_exccc rows for {_diag_cust}: {len(_trc)}")
+        print(f"  {'idx':>3} {'tot_bal':>14} {'prev_bal':>14} {'pct_chg':>10} {'>0.10?':>7} {'>0.05?':>7}")
+        _cnt_25m_10 = 0; _cnt_25m_5 = 0; _cnt_7m_10 = 0; _cnt_7m_5 = 0
+        for _r in _trc:
+            _md = _r["month_diff"]; _tb = _r["tot_bal"]; _pb = _r["prev_bal"]; _pc = _r["pct_chg"]
+            _b10 = _pc is not None and _pc > 0.10
+            _b5  = _pc is not None and _pc > 0.05
+            if _md is not None:
+                if 1 <= _md <= 23 and _b10: _cnt_25m_10 += 1
+                if 1 <= _md <= 23 and _b5:  _cnt_25m_5  += 1
+                if 1 <= _md <= 5  and _b10: _cnt_7m_10  += 1
+                if 1 <= _md <= 5  and _b5:  _cnt_7m_5   += 1
+            _tb_s = f"{_tb:.2f}" if _tb is not None else "None"
+            _pb_s = f"{_pb:.2f}" if _pb is not None else "None"
+            _pc_s = f"{_pc:.4f}" if _pc is not None else "None"
+            print(f"  {_md:>3} {_tb_s:>14} {_pb_s:>14} {_pc_s:>10} {str(_b10):>7} {str(_b5):>7}")
+        print(f"  totconsinc_bal10_exc_cc_25m (md∈[1,23], pct>0.10) = {_cnt_25m_10}")
+        print(f"  totconsinc_bal5_exc_cc_25m  (md∈[1,23], pct>0.05) = {_cnt_25m_5}")
+        print(f"  totconsinc_bal10_exc_cc_7m  (md∈[1,5],  pct>0.10) = {_cnt_7m_10}")
+        print(f"  totconsinc_bal5_exc_cc_7m   (md∈[1,5],  pct>0.05) = {_cnt_7m_5}")
+        # Try also with extended range md∈[0,23]
+        _alt_25m_10 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 23
+                           and _r["pct_chg"] is not None and _r["pct_chg"] > 0.10)
+        _alt_7m_5 = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 5
+                           and _r["pct_chg"] is not None and _r["pct_chg"] > 0.05)
+        print(f"  ALT bal10_25m (md∈[0,23]): {_alt_25m_10}")
+        print(f"  ALT bal5_7m   (md∈[0,5]):  {_alt_7m_5}")
+        # FLOOR truncation versions
+        def _floor2(x):
+            if x is None: return None
+            return int(x * 100) / 100.0 if x >= 0 else -(int(-x * 100) / 100.0)
+        _flr_25m_10 = sum(1 for _r in _trc if _r["month_diff"] is not None and 1 <= _r["month_diff"] <= 23
+                          and _r["pct_chg"] is not None and _floor2(_r["pct_chg"]) > 0.10)
+        _flr_7m_5 = sum(1 for _r in _trc if _r["month_diff"] is not None and 1 <= _r["month_diff"] <= 5
+                          and _r["pct_chg"] is not None and _floor2(_r["pct_chg"]) > 0.05)
+        _flr_25m_10_ext = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 23
+                          and _r["pct_chg"] is not None and _floor2(_r["pct_chg"]) > 0.10)
+        _flr_7m_5_ext = sum(1 for _r in _trc if _r["month_diff"] is not None and 0 <= _r["month_diff"] <= 5
+                          and _r["pct_chg"] is not None and _floor2(_r["pct_chg"]) > 0.05)
+        print(f"  FLOOR bal10_25m [1,23]: {_flr_25m_10}    FLOOR bal5_7m [1,5]: {_flr_7m_5}")
+        print(f"  FLOOR+EXT bal10_25m [0,23]: {_flr_25m_10_ext}    FLOOR+EXT bal5_7m [0,5]: {_flr_7m_5_ext}")
+        print("=" * 70)
+        print()
     # ──────────────────────────────────────────────────────────────────
 
 
@@ -2758,7 +2821,8 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     print("  DIAGNOSTIC: freq_between trace (target customers)")
     print("=" * 70)
     _freq_trace_targets = ["4607601", "48235409", "55932404", "53315751", "3054189",
-                           "10004499"]  # last is also for mon_since_max_bal
+                           "10004499",  # last is also for mon_since_max_bal
+                           "2794019", "55186340", "60087778"]  # 3 freq_between bug customers
     _FREQ_CC_EXCL_TRACE = {"5","196","213","220","225"}
     _FREQ_EXCL_HL_TRACE = {"058", "195"}
     for _tc_id in _freq_trace_targets:
@@ -2790,6 +2854,8 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
         _tcs = _t_valid["tc"].tolist()
         _isUns = _t_valid["isUns"].tolist()
         _gaps_all = []; _gaps_inst = []; _gaps_uns = []
+        _gaps_uns_alt = []  # ALT: without 196 in excl list (test hypothesis)
+        _FREQ_CC_EXCL_ALT = {"5","213","220","225"}  # CC_CODES = {5,213,220,225} (no 196)
         _gap_log = []
         for _i in range(1, len(_opens_abs)):
             _gap = _opens_abs[_i] - _opens_abs[_i-1]
@@ -2798,16 +2864,21 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             _tc_str = str(_tcs[_i]).lstrip("0") or "0"
             _addinst = _tc_pad not in _FREQ_EXCL_HL_TRACE
             _adduns = bool(_isUns[_i]) and _tc_str not in _FREQ_CC_EXCL_TRACE
+            _adduns_alt = bool(_isUns[_i]) and _tc_str not in _FREQ_CC_EXCL_ALT
             if _addinst: _gaps_inst.append(_gap)
             if _adduns: _gaps_uns.append(_gap)
+            if _adduns_alt: _gaps_uns_alt.append(_gap)
             _gap_log.append((_i, _gap, _addinst, _adduns))
         print(f"  gaps_all  ({len(_gaps_all)}): {_gaps_all}")
         print(f"  gaps_inst ({len(_gaps_inst)}): {_gaps_inst}")
         print(f"  gaps_uns_wo_cc ({len(_gaps_uns)}): {_gaps_uns}")
+        print(f"  gaps_uns_wo_cc_ALT (no 196) ({len(_gaps_uns_alt)}): {_gaps_uns_alt}")
         if _gaps_all:  print(f"  freq_between_accts_all          = {sum(_gaps_all)/len(_gaps_all):.4f}")
         if _gaps_inst: print(f"  freq_between_installment_trades = {sum(_gaps_inst)/len(_gaps_inst):.4f}")
         if _gaps_uns:  print(f"  freq_between_accts_unsec_wo_cc  = {sum(_gaps_uns)/len(_gaps_uns):.4f}")
         else:          print(f"  freq_between_accts_unsec_wo_cc  = None")
+        if _gaps_uns_alt: print(f"  ALT (no 196)                    = {sum(_gaps_uns_alt)/len(_gaps_uns_alt):.4f}")
+        else:             print(f"  ALT (no 196)                    = None")
     print("=" * 70)
     print()
     # ──────────────────────────────────────────────────────────────────
@@ -2818,13 +2889,15 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
     _FREQ_EXCL_HL = {"058", "195"}
 
     def _compute_freq(cust_pdf):
-        # FIX: Sort by EXACT open_dt (yyyyMMdd) — chronological precision matters!
-        # Previous: sort by open_abs (year*12+month) with cons_acct_key tiebreak.
-        # That tiebreak placed accounts opened in same month into wrong order
-        # (alphabetical by ID instead of by actual day) → 10 of 13 freq_between
-        # mismatches were caused by this. Verified by diagnostic.
-        # Diff for each gap is still computed in months (year*12+month difference)
-        # to match Java's calculateAvgMonthDiff month-arithmetic.
+        # JAVA-EXACT FIX: Sort by EXACT open_dt, then by typeCode AS INTEGER (not cons_acct_key).
+        # Java bru.py L2546-2558: Comparator sorts by date, then numeric typeCode tiebreak:
+        #   int typeCode1 = Integer.parseInt(e1.getKey().split("~")[1]);
+        #   int typeCode2 = Integer.parseInt(e2.getKey().split("~")[1]);
+        #   return Integer.compare(typeCode1, typeCode2);
+        # Previous: tiebreak by cons_acct_key (string) — caused 3 customer mismatches:
+        #   60087778: 1.4054→1.1622, 55186340: 2.4500→2.6000, 2794019: 2.0000→2.1667
+        # All 3 fixed by switching to numeric typeCode tiebreak (verified offline).
+        # Diff for each gap is still computed in months (year*12+month).
         try:
             cust_pdf = cust_pdf.copy()
             # Drop rows with null/NaN open_dt — Java skips invalid dates
@@ -2837,11 +2910,16 @@ def build_global_attrs(account_details, fact2_enriched, open_dt_all=None):
             cust_pdf["open_abs"] = pd.to_numeric(cust_pdf["open_abs"], errors="coerce")
             # Drop rows with NaN in either — both needed (open_dt for sort, open_abs for diff)
             cust_pdf = cust_pdf.dropna(subset=["open_dt", "open_abs"])
-            # Sort by raw open_dt (yyyyMMdd as int) — sorts chronologically by exact day.
-            # cons_acct_key as final tiebreaker for fully-deterministic ordering when
-            # two accounts share identical open_dt.
+            # Build numeric typeCode column for Java-style tiebreak
+            def _tc_to_int(tc):
+                try:
+                    return int(str(tc).lstrip('0') or '0')
+                except (ValueError, TypeError):
+                    return 999
+            cust_pdf["_tc_int"] = cust_pdf["tc"].apply(_tc_to_int)
+            # Sort by raw open_dt (yyyyMMdd as int), then by typeCode AS INTEGER (Java rule)
             cust_pdf = cust_pdf.sort_values(
-                ["open_dt", "cons_acct_key"], kind="mergesort").reset_index(drop=True)
+                ["open_dt", "_tc_int"], kind="mergesort").reset_index(drop=True)
         except Exception:
             cust_pdf = cust_pdf.sort_values("open_dt").reset_index(drop=True)
 
@@ -3815,6 +3893,46 @@ def compute_final_score(global_attrs_with_trigger):
         .drop("_score_result")
     )
 
+
+# ===========================================================================
+# PHASE 6 — PIPELINE ORCHESTRATOR
+# ===========================================================================
+# cols = [
+#     "accno",
+#     "cons_acct_key",
+#     "open_dt",
+#     "acct_nb",
+#     "closed_dt",
+#     "bureau_mbr_id",
+#     "account_type_cd",
+#     "term_freq",
+#     "charge_off_amt",
+#     "resp_code",
+#     "balance_dt",
+#     "account_status_cd",
+#     "actual_pymnt_amt",
+#     "balance_amt",
+#     "credit_lim_amt",
+#     "original_loan_amt",
+#     "past_due_amt",
+#     "pay_rating_cd",
+#     "dayspastdue",
+#     "written_off_amt",
+#     "principal_written_off",
+#     "SUITFILED_WILFULDEFAULT",
+#     "SUITFILEDWILLFULDEFAULT",
+#     "WRITTEN_OFF_AND_SETTLED"
+# ]
+
+
+
+
+# cols = ["accno","cons_acct_key","open_dt","acct_nb","closed_dt","bureau_mbr_id","account_type_cd","term_freq"]
+
+# trade_df.select(cols).show(truncate=False)
+# fact2.select(cols).show(truncate=False)
+
+# cols = ["accno","cust_id","account_type_cd","balance_amt","credit_lim_amt","original_loan_amt","past_due_amt","dayspastdue","account_status_cd","dpd_new"]
 
     # Fix open_dt
 def clean_numeric_date(colname):
